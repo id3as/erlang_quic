@@ -1,0 +1,26 @@
+# Build artifacts
+_build/
+ebin/
+*.beam
+
+# Dependencies
+deps/
+
+# Rebar3
+.rebar3/
+rebar.lock
+
+# Editor files
+*.swp
+*~
+.idea/
+*.iml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.eunit/
+logs/
+log/
