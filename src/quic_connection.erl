@@ -22,7 +22,6 @@
 %%% == Messages to Owner ==
 %%%
 %%% {quic, ConnRef, {connected, Info}}
-%%% {quic, ConnRef, {stream_headers, StreamId, Headers, Fin}}
 %%% {quic, ConnRef, {stream_data, StreamId, Data, Fin}}
 %%% {quic, ConnRef, {stream_opened, StreamId}}
 %%% {quic, ConnRef, {closed, Reason}}
@@ -68,7 +67,6 @@
     start_link/5,
     connect/4,
     send_data/4,
-    send_headers/4,
     open_stream/1,
     open_unidirectional_stream/1,
     close/2,
@@ -316,12 +314,6 @@ start_server(Opts) ->
 send_data(Conn, StreamId, Data, Fin) ->
     gen_statem:call(Conn, {send_data, StreamId, Data, Fin}).
 
-%% @doc Send headers on a stream (HTTP/3).
--spec send_headers(pid(), non_neg_integer(), [{binary(), binary()}], boolean()) ->
-    ok | {error, term()}.
-send_headers(Conn, StreamId, Headers, Fin) ->
-    gen_statem:call(Conn, {send_headers, StreamId, Headers, Fin}).
-
 %% @doc Open a new bidirectional stream.
 -spec open_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
 open_stream(Conn) ->
@@ -411,85 +403,23 @@ init([Host, Port, Opts, Owner, Socket]) ->
     %% Determine remote address
     RemoteAddr = resolve_address(Host, Port),
 
-    %% Create or use provided socket
-    {ok, Sock, LocalAddr} = case Socket of
-        undefined ->
-            {ok, S} = gen_udp:open(0, [binary, {active, false}]),
-            {ok, LA} = inet:sockname(S),
-            {ok, S, LA};
-        S ->
-            {ok, LA} = inet:sockname(S),
-            {ok, S, LA}
-    end,
-
-    %% Generate initial keys
-    InitialKeys = derive_initial_keys(DCID),
-
-    %% Initialize packet number spaces
-    PNSpace = #pn_space{
-        next_pn = 0,
-        largest_acked = undefined,
-        largest_recv = undefined,
-        recv_time = undefined,
-        ack_ranges = [],
-        ack_eliciting_in_flight = 0,
-        loss_time = undefined,
-        sent_packets = #{}
-    },
-
-    %% Create connection reference and register
-    ConnRef = make_ref(),
-    register_conn(ConnRef, self()),
-
-    %% Get server name for SNI
-    ServerName = case maps:get(server_name, Opts, undefined) of
-        undefined when is_binary(Host) -> Host;
-        undefined when is_list(Host) -> list_to_binary(Host);
-        SN -> SN
-    end,
-
-    %% Get ALPN list
-    AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
-    AlpnList = normalize_alpn_list(AlpnOpt),
-
-    %% Initialize congestion control and loss detection
-    CCState = quic_cc:new(),
-    LossState = quic_loss:new(),
-
-    %% Initialize state
-    State = #state{
-        scid = SCID,
-        dcid = DCID,
-        original_dcid = DCID,
-        role = client,
-        socket = Sock,
-        remote_addr = RemoteAddr,
-        local_addr = LocalAddr,
-        owner = Owner,
-        conn_ref = ConnRef,
-        server_name = ServerName,
-        verify = maps:get(verify, Opts, false),
-        initial_keys = InitialKeys,
-        tls_state = ?TLS_AWAITING_SERVER_HELLO,
-        alpn_list = AlpnList,
-        pn_initial = PNSpace,
-        pn_handshake = PNSpace,
-        pn_app = PNSpace,
-        max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
-        max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
-        next_stream_id_bidi = 0,  % Client-initiated bidi: 0, 4, 8, ...
-        next_stream_id_uni = 2,   % Client-initiated uni: 2, 6, 10, ...
-        max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
-        max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
-        max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
-        max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
-        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
-        last_activity = erlang:monotonic_time(millisecond),
-        cc_state = CCState,
-        loss_state = LossState
-    },
-
-    {ok, idle, State};
+    %% Create or use provided socket with proper cleanup on failure
+    case open_client_socket(Socket) of
+        {ok, Sock, LocalAddr, OwnsSocket} ->
+            try
+                init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
+            catch
+                Class:Reason:Stack ->
+                    %% Clean up socket on initialization failure
+                    case OwnsSocket of
+                        true -> gen_udp:close(Sock);
+                        false -> ok
+                    end,
+                    erlang:raise(Class, Reason, Stack)
+            end;
+        {error, Reason} ->
+            {stop, Reason}
+    end;
 
 %% Server-side initialization
 init({server, Opts}) ->
@@ -563,6 +493,96 @@ init({server, Opts}) ->
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey
+    },
+
+    {ok, idle, State}.
+
+%% Helper to open or use provided socket for client
+open_client_socket(undefined) ->
+    case gen_udp:open(0, [binary, {active, false}]) of
+        {ok, S} ->
+            case inet:sockname(S) of
+                {ok, LA} -> {ok, S, LA, true};
+                {error, Reason} ->
+                    gen_udp:close(S),
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end;
+open_client_socket(S) ->
+    case inet:sockname(S) of
+        {ok, LA} -> {ok, S, LA, false};
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% Continue client initialization after socket is ready
+init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
+    %% Generate initial keys
+    InitialKeys = derive_initial_keys(DCID),
+
+    %% Initialize packet number spaces
+    PNSpace = #pn_space{
+        next_pn = 0,
+        largest_acked = undefined,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0,
+        loss_time = undefined,
+        sent_packets = #{}
+    },
+
+    %% Create connection reference and register
+    ConnRef = make_ref(),
+    register_conn(ConnRef, self()),
+
+    %% Get server name for SNI
+    ServerName = case maps:get(server_name, Opts, undefined) of
+        undefined when is_binary(Host) -> Host;
+        undefined when is_list(Host) -> list_to_binary(Host);
+        SN -> SN
+    end,
+
+    %% Get ALPN list
+    AlpnOpt = maps:get(alpn, Opts, [<<"h3">>]),
+    AlpnList = normalize_alpn_list(AlpnOpt),
+
+    %% Initialize congestion control and loss detection
+    CCState = quic_cc:new(),
+    LossState = quic_loss:new(),
+
+    %% Initialize state
+    State = #state{
+        scid = SCID,
+        dcid = DCID,
+        original_dcid = DCID,
+        role = client,
+        socket = Sock,
+        remote_addr = RemoteAddr,
+        local_addr = LocalAddr,
+        owner = Owner,
+        conn_ref = ConnRef,
+        server_name = ServerName,
+        verify = maps:get(verify, Opts, false),
+        initial_keys = InitialKeys,
+        tls_state = ?TLS_AWAITING_SERVER_HELLO,
+        alpn_list = AlpnList,
+        pn_initial = PNSpace,
+        pn_handshake = PNSpace,
+        pn_app = PNSpace,
+        max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
+        max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        next_stream_id_bidi = 0,  % Client-initiated bidi: 0, 4, 8, ...
+        next_stream_id_uni = 2,   % Client-initiated uni: 2, 6, 10, ...
+        max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
+        max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        last_activity = erlang:monotonic_time(millisecond),
+        cc_state = CCState,
+        loss_state = LossState
     },
 
     {ok, idle, State}.
@@ -681,15 +701,6 @@ connected({call, From}, sockname, #state{local_addr = Addr} = State) ->
 
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
-        {ok, NewState} ->
-            {keep_state, NewState, [{reply, From, ok}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
-
-connected({call, From}, {send_headers, StreamId, Headers, Fin}, State) ->
-    %% HTTP/3 headers - encode and send on stream
-    case do_send_headers(StreamId, Headers, Fin, State) of
         {ok, NewState} ->
             {keep_state, NewState, [{reply, From, ok}]};
         {error, Reason} ->
@@ -2214,11 +2225,6 @@ process_send_queue(#state{send_queue = [{stream_data, StreamId, Offset, Data, Fi
         [_ | _] -> State2;  % Queue has items, stop for now
         [] -> process_send_queue(State2)  % Keep processing
     end.
-
-%% Send HTTP/3 headers on a stream
-do_send_headers(_StreamId, _Headers, _Fin, State) ->
-    %% TODO: Encode headers using QPACK and send
-    {ok, State}.
 
 %% Close a stream
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->

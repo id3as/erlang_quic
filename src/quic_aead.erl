@@ -47,6 +47,9 @@
 -define(HP_SAMPLE_OFFSET, 4).
 -define(HP_SAMPLE_LEN, 16).
 
+%% Minimum payload size for header protection sample
+-define(MIN_PAYLOAD_FOR_SAMPLE, ?HP_SAMPLE_OFFSET + ?HP_SAMPLE_LEN).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -98,9 +101,10 @@ decrypt(Key, IV, PN, AAD, CiphertextWithTag) ->
 %% Since PN is at the end of Header, and ciphertext comes after PN:
 %% sample_offset = 4 - PNLen (where PNLen is encoded in the first byte)
 %%
-%% Returns: Protected header (first byte and PN bytes masked)
+%% Returns: Protected header (first byte and PN bytes masked), or
+%%          {error, payload_too_short} if payload is too small for sampling.
 -spec protect_header(binary(), binary(), binary(), non_neg_integer()) ->
-    binary().
+    binary() | {error, payload_too_short}.
 protect_header(HP, Header, EncryptedPayload, PNOffset) ->
     Cipher = cipher_for_key(HP),
     <<FirstByte, _/binary>> = Header,
@@ -109,9 +113,15 @@ protect_header(HP, Header, EncryptedPayload, PNOffset) ->
     %% This is because sample_offset = pn_offset + 4 in the full packet
     %% And ciphertext starts at pn_offset + PNLen
     SampleOffset = max(0, 4 - PNLen),
-    Sample = binary:part(EncryptedPayload, SampleOffset, ?HP_SAMPLE_LEN),
-    Mask = compute_hp_mask(Cipher, HP, Sample),
-    apply_header_mask(Header, Mask, PNOffset).
+    RequiredLen = SampleOffset + ?HP_SAMPLE_LEN,
+    case byte_size(EncryptedPayload) >= RequiredLen of
+        true ->
+            Sample = binary:part(EncryptedPayload, SampleOffset, ?HP_SAMPLE_LEN),
+            Mask = compute_hp_mask(Cipher, HP, Sample),
+            apply_header_mask(Header, Mask, PNOffset);
+        false ->
+            {error, payload_too_short}
+    end.
 
 %% @doc Remove header protection from a QUIC packet.
 %%
@@ -123,38 +133,43 @@ protect_header(HP, Header, EncryptedPayload, PNOffset) ->
 %% The sample is taken at position 4 from the start of PN.
 %% Since EncryptedPayload starts with PN, sample is at position 4.
 %%
-%% Returns: {UnprotectedHeader, PNLength}
+%% Returns: {UnprotectedHeader, PNLength} or {error, payload_too_short}
 -spec unprotect_header(binary(), binary(), binary(), non_neg_integer()) ->
-    {binary(), pos_integer()}.
+    {binary(), pos_integer()} | {error, payload_too_short}.
 unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
-    Cipher = cipher_for_key(HP),
-    %% Sample is at position 4 from start of PN
-    %% PN is at position 0 of EncryptedPayload
-    Sample = binary:part(EncryptedPayload, ?HP_SAMPLE_OFFSET, ?HP_SAMPLE_LEN),
-    Mask = compute_hp_mask(Cipher, HP, Sample),
+    case byte_size(EncryptedPayload) >= ?MIN_PAYLOAD_FOR_SAMPLE of
+        false ->
+            {error, payload_too_short};
+        true ->
+            Cipher = cipher_for_key(HP),
+            %% Sample is at position 4 from start of PN
+            %% PN is at position 0 of EncryptedPayload
+            Sample = binary:part(EncryptedPayload, ?HP_SAMPLE_OFFSET, ?HP_SAMPLE_LEN),
+            Mask = compute_hp_mask(Cipher, HP, Sample),
 
-    <<ProtectedFirstByte, HeaderRest/binary>> = ProtectedHeader,
-    <<MaskByte0, MaskByte1, MaskByte2, MaskByte3, MaskByte4, _/binary>> = Mask,
+            <<ProtectedFirstByte, HeaderRest/binary>> = ProtectedHeader,
+            <<MaskByte0, MaskByte1, MaskByte2, MaskByte3, MaskByte4, _/binary>> = Mask,
 
-    %% Unmask first byte to get PN length
-    IsLongHeader = (ProtectedFirstByte band 16#80) =:= 16#80,
-    FirstByteMask = case IsLongHeader of
-        true -> MaskByte0 band 16#0f;
-        false -> MaskByte0 band 16#1f
-    end,
-    FirstByte = ProtectedFirstByte bxor FirstByteMask,
+            %% Unmask first byte to get PN length
+            IsLongHeader = (ProtectedFirstByte band 16#80) =:= 16#80,
+            FirstByteMask = case IsLongHeader of
+                true -> MaskByte0 band 16#0f;
+                false -> MaskByte0 band 16#1f
+            end,
+            FirstByte = ProtectedFirstByte bxor FirstByteMask,
 
-    %% Get PN length from unmasked first byte
-    PNLen = (FirstByte band 16#03) + 1,
+            %% Get PN length from unmasked first byte
+            PNLen = (FirstByte band 16#03) + 1,
 
-    %% PN is at the start of EncryptedPayload, unmask it
-    <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
-    PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
-    PN = crypto:exor(ProtectedPN, PNMask),
+            %% PN is at the start of EncryptedPayload, unmask it
+            <<ProtectedPN:PNLen/binary, _/binary>> = EncryptedPayload,
+            PNMask = binary:part(<<MaskByte1, MaskByte2, MaskByte3, MaskByte4>>, 0, PNLen),
+            PN = crypto:exor(ProtectedPN, PNMask),
 
-    %% Return unprotected header (first byte + rest) with PN appended
-    UnprotectedHeader = <<FirstByte, HeaderRest/binary, PN/binary>>,
-    {UnprotectedHeader, PNLen}.
+            %% Return unprotected header (first byte + rest) with PN appended
+            UnprotectedHeader = <<FirstByte, HeaderRest/binary, PN/binary>>,
+            {UnprotectedHeader, PNLen}
+    end.
 
 %% @doc Compute the nonce for AEAD by XORing IV with packet number.
 %% Packet number is left-padded to 12 bytes.

@@ -74,6 +74,9 @@
 -opaque ack_state() :: #ack_state{}.
 -export_type([ack_state/0]).
 
+%% Maximum ACK range size to prevent memory exhaustion
+-define(MAX_ACK_RANGE, 65536).
+
 %%====================================================================
 %% ACK State Management
 %%====================================================================
@@ -182,36 +185,39 @@ process_ack(State, AckFrame) ->
 %% @doc Process a received ACK frame with sent packet info.
 %% SentPackets is a map of PacketNumber => SentPacketInfo
 -spec process_ack(ack_state(), term(), map()) ->
-    {ack_state(), [non_neg_integer()]}.
+    {ack_state(), [non_neg_integer()]} | {error, ack_range_too_large}.
 process_ack(State, {ack, LargestAcked, _AckDelay, FirstRange, AckRanges}, SentPackets) ->
     %% Build list of acknowledged packet numbers
-    AckedPNs = ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges),
+    case ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) of
+        {error, _} = Error ->
+            Error;
+        AckedPNs ->
+            %% Filter to only packets we actually sent
+            NewlyAcked = case maps:size(SentPackets) of
+                0 -> AckedPNs;
+                _ -> [PN || PN <- AckedPNs, maps:is_key(PN, SentPackets)]
+            end,
 
-    %% Filter to only packets we actually sent
-    NewlyAcked = case maps:size(SentPackets) of
-        0 -> AckedPNs;
-        _ -> [PN || PN <- AckedPNs, maps:is_key(PN, SentPackets)]
-    end,
+            %% Update largest acked
+            NewLargestAcked = case State#ack_state.largest_acked of
+                undefined -> LargestAcked;
+                Old when LargestAcked > Old -> LargestAcked;
+                Old -> Old
+            end,
 
-    %% Update largest acked
-    NewLargestAcked = case State#ack_state.largest_acked of
-        undefined -> LargestAcked;
-        Old when LargestAcked > Old -> LargestAcked;
-        Old -> Old
-    end,
+            %% Update ACK-eliciting in flight count
+            AckElicitingAcked = length([PN || PN <- NewlyAcked,
+                                              maps:is_key(PN, SentPackets),
+                                              is_ack_eliciting(maps:get(PN, SentPackets))]),
+            NewInFlight = max(0, State#ack_state.ack_eliciting_in_flight - AckElicitingAcked),
 
-    %% Update ACK-eliciting in flight count
-    AckElicitingAcked = length([PN || PN <- NewlyAcked,
-                                      maps:is_key(PN, SentPackets),
-                                      is_ack_eliciting(maps:get(PN, SentPackets))]),
-    NewInFlight = max(0, State#ack_state.ack_eliciting_in_flight - AckElicitingAcked),
+            NewState = State#ack_state{
+                largest_acked = NewLargestAcked,
+                ack_eliciting_in_flight = NewInFlight
+            },
 
-    NewState = State#ack_state{
-        largest_acked = NewLargestAcked,
-        ack_eliciting_in_flight = NewInFlight
-    },
-
-    {NewState, NewlyAcked};
+            {NewState, NewlyAcked}
+    end;
 
 process_ack(State, {ack_ecn, LargestAcked, AckDelay, FirstRange, AckRanges, _ECT0, _ECT1, _ECNCE}, SentPackets) ->
     %% Process as regular ACK, ignoring ECN counts for now
@@ -277,16 +283,22 @@ ranges_to_ack_ranges(PrevStart, [{Start, End} | Rest]) ->
     [{Gap, Range} | ranges_to_ack_ranges(Start, Rest)].
 
 %% Convert ACK frame format back to list of packet numbers
+%% Returns list of packet numbers or {error, ack_range_too_large}
 ack_frame_to_pn_list(LargestAcked, FirstRange, AckRanges) ->
     %% First range: LargestAcked - FirstRange to LargestAcked
     FirstEnd = LargestAcked,
     FirstStart = LargestAcked - FirstRange,
-    FirstPNs = lists:seq(FirstStart, FirstEnd),
-
-    %% Process remaining ranges
-    RestPNs = ack_ranges_to_pn_list(FirstStart, AckRanges),
-
-    FirstPNs ++ RestPNs.
+    case FirstEnd - FirstStart > ?MAX_ACK_RANGE of
+        true ->
+            {error, ack_range_too_large};
+        false ->
+            FirstPNs = lists:seq(FirstStart, FirstEnd),
+            %% Process remaining ranges
+            case ack_ranges_to_pn_list(FirstStart, AckRanges) of
+                {error, _} = Error -> Error;
+                RestPNs -> FirstPNs ++ RestPNs
+            end
+    end.
 
 ack_ranges_to_pn_list(_PrevStart, []) ->
     [];
@@ -294,8 +306,16 @@ ack_ranges_to_pn_list(PrevStart, [{Gap, Range} | Rest]) ->
     %% End of this range
     End = PrevStart - Gap - 2,
     Start = End - Range,
-    PNs = lists:seq(Start, End),
-    PNs ++ ack_ranges_to_pn_list(Start, Rest).
+    case End - Start > ?MAX_ACK_RANGE of
+        true ->
+            {error, ack_range_too_large};
+        false ->
+            PNs = lists:seq(Start, End),
+            case ack_ranges_to_pn_list(Start, Rest) of
+                {error, _} = Error -> Error;
+                RestPNs -> PNs ++ RestPNs
+            end
+    end.
 
 %% Check if a sent packet info indicates ACK-eliciting
 is_ack_eliciting(#sent_packet{ack_eliciting = AE}) -> AE;

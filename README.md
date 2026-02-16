@@ -93,7 +93,6 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 | `{connected, Info}` | Connection established |
 | `{stream_opened, StreamId}` | New stream opened by peer |
 | `{stream_data, StreamId, Data, Fin}` | Data received on stream |
-| `{stream_headers, StreamId, Headers, Fin}` | HTTP/3 headers received |
 | `{stream_reset, StreamId, ErrorCode}` | Stream reset by peer |
 | `{closed, Reason}` | Connection closed |
 | `{transport_error, Code, Reason}` | Transport error |
@@ -113,7 +112,6 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 - `quic:open_stream/1` - Open bidirectional stream
 - `quic:open_unidirectional_stream/1` - Open unidirectional stream
 - `quic:send_data/4` - Send data on stream
-- `quic:send_headers/4` - Send HTTP/3 headers
 - `quic:reset_stream/3` - Reset a stream
 
 ### Server

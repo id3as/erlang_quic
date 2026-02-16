@@ -66,6 +66,9 @@
                        ECT1 :: non_neg_integer(),
                        ECNCE :: non_neg_integer()}.
 
+%% Maximum frame data length to prevent memory exhaustion
+-define(MAX_FRAME_DATA_LEN, 65535).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -235,13 +238,23 @@ decode(<<?FRAME_STOP_SENDING, Rest/binary>>) ->
 decode(<<?FRAME_CRYPTO, Rest/binary>>) ->
     {Offset, Rest1} = quic_varint:decode(Rest),
     {Length, Rest2} = quic_varint:decode(Rest1),
-    <<Data:Length/binary, Rest3/binary>> = Rest2,
-    {{crypto, Offset, Data}, Rest3};
+    case Length > ?MAX_FRAME_DATA_LEN of
+        true ->
+            {error, frame_too_large};
+        false ->
+            <<Data:Length/binary, Rest3/binary>> = Rest2,
+            {{crypto, Offset, Data}, Rest3}
+    end;
 
 decode(<<?FRAME_NEW_TOKEN, Rest/binary>>) ->
     {Length, Rest1} = quic_varint:decode(Rest),
-    <<Token:Length/binary, Rest2/binary>> = Rest1,
-    {{new_token, Token}, Rest2};
+    case Length > ?MAX_FRAME_DATA_LEN of
+        true ->
+            {error, frame_too_large};
+        false ->
+            <<Token:Length/binary, Rest2/binary>> = Rest1,
+            {{new_token, Token}, Rest2}
+    end;
 
 decode(<<Type, Rest/binary>>) when Type >= ?FRAME_STREAM, Type =< 16#0f ->
     HasOff = (Type band ?STREAM_FLAG_OFF) =/= 0,
@@ -252,16 +265,20 @@ decode(<<Type, Rest/binary>>) when Type >= ?FRAME_STREAM, Type =< 16#0f ->
         true -> quic_varint:decode(Rest1);
         false -> {0, Rest1}
     end,
-    {Data, Rest3} = case HasLen of
+    case HasLen of
         true ->
             {Length, R} = quic_varint:decode(Rest2),
-            <<D:Length/binary, R2/binary>> = R,
-            {D, R2};
+            case Length > ?MAX_FRAME_DATA_LEN of
+                true ->
+                    {error, frame_too_large};
+                false ->
+                    <<D:Length/binary, R2/binary>> = R,
+                    {{stream, StreamId, Offset, D, Fin}, R2}
+            end;
         false ->
             %% Data extends to end of packet
-            {Rest2, <<>>}
-    end,
-    {{stream, StreamId, Offset, Data, Fin}, Rest3};
+            {{stream, StreamId, Offset, Rest2, Fin}, <<>>}
+    end;
 
 decode(<<?FRAME_MAX_DATA, Rest/binary>>) ->
     {MaxData, Rest1} = quic_varint:decode(Rest),
@@ -318,14 +335,24 @@ decode(<<?FRAME_CONNECTION_CLOSE, Rest/binary>>) ->
     {ErrorCode, Rest1} = quic_varint:decode(Rest),
     {FrameType, Rest2} = quic_varint:decode(Rest1),
     {ReasonLen, Rest3} = quic_varint:decode(Rest2),
-    <<Reason:ReasonLen/binary, Rest4/binary>> = Rest3,
-    {{connection_close, transport, ErrorCode, FrameType, Reason}, Rest4};
+    case ReasonLen > ?MAX_FRAME_DATA_LEN of
+        true ->
+            {error, frame_too_large};
+        false ->
+            <<Reason:ReasonLen/binary, Rest4/binary>> = Rest3,
+            {{connection_close, transport, ErrorCode, FrameType, Reason}, Rest4}
+    end;
 
 decode(<<?FRAME_CONNECTION_CLOSE_APP, Rest/binary>>) ->
     {ErrorCode, Rest1} = quic_varint:decode(Rest),
     {ReasonLen, Rest2} = quic_varint:decode(Rest1),
-    <<Reason:ReasonLen/binary, Rest3/binary>> = Rest2,
-    {{connection_close, application, ErrorCode, undefined, Reason}, Rest3};
+    case ReasonLen > ?MAX_FRAME_DATA_LEN of
+        true ->
+            {error, frame_too_large};
+        false ->
+            <<Reason:ReasonLen/binary, Rest3/binary>> = Rest2,
+            {{connection_close, application, ErrorCode, undefined, Reason}, Rest3}
+    end;
 
 decode(<<?FRAME_HANDSHAKE_DONE, Rest/binary>>) ->
     {handshake_done, Rest};

@@ -91,23 +91,11 @@ derive_initial_server(DCID, Version) ->
 %% @doc Derive keys from a traffic secret.
 %% Returns {Key, IV, HP} for the given secret.
 -spec derive_keys(binary(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) -> keys().
-derive_keys(Secret, aes_128_gcm) ->
-    %% AES-128-GCM uses SHA-256
-    Key = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 16),
-    IV = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 16),
-    {Key, IV, HP};
-derive_keys(Secret, aes_256_gcm) ->
-    %% AES-256-GCM uses SHA-384
-    Key = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
-    IV = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
-    {Key, IV, HP};
-derive_keys(Secret, chacha20_poly1305) ->
-    %% ChaCha20-Poly1305 uses SHA-256
-    Key = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
-    IV = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
+derive_keys(Secret, Cipher) ->
+    {Hash, KeyLen, HPLen} = cipher_params(Cipher),
+    Key = quic_hkdf:expand_label(Hash, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, KeyLen),
+    IV = quic_hkdf:expand_label(Hash, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
+    HP = quic_hkdf:expand_label(Hash, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, HPLen),
     {Key, IV, HP}.
 
 %% @doc Derive traffic keys (Key, IV, HP) from a traffic secret.
@@ -142,6 +130,11 @@ derive_updated_keys(CurrentSecret, Cipher) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% Get cipher parameters: {Hash, KeyLen, HPLen}
+cipher_params(aes_128_gcm) -> {sha256, 16, 16};
+cipher_params(aes_256_gcm) -> {sha384, 32, 32};
+cipher_params(chacha20_poly1305) -> {sha256, 32, 32}.
 
 %% Get the initial salt for a QUIC version
 initial_salt(?QUIC_VERSION_1) ->

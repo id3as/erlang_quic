@@ -40,7 +40,7 @@ extract(Salt, IKM) ->
 -spec extract(atom(), binary(), binary()) -> binary().
 extract(Hash, <<>>, IKM) ->
     %% RFC 5869: if salt is not provided, use HashLen zeros
-    ZeroSalt = binary:copy(<<0>>, hash_len(Hash)),
+    ZeroSalt = binary:copy(<<0>>, quic_crypto:hash_len(Hash)),
     crypto:mac(hmac, Hash, ZeroSalt, IKM);
 extract(Hash, Salt, IKM) ->
     crypto:mac(hmac, Hash, Salt, IKM).
@@ -56,7 +56,7 @@ expand(PRK, Info, Length) ->
 expand(_Hash, _PRK, _Info, 0) ->
     <<>>;
 expand(Hash, PRK, Info, Length) ->
-    HashLen = hash_len(Hash),
+    HashLen = quic_crypto:hash_len(Hash),
     MaxLen = 255 * HashLen,
     true = Length =< MaxLen,  % Assert valid length
     N = ceiling(Length, HashLen),
@@ -96,10 +96,6 @@ expand_loop(Hash, PRK, Info, N, I, Prev, Acc) ->
     %% T(i) = HMAC-Hash(PRK, T(i-1) | info | i)
     T = crypto:mac(hmac, Hash, PRK, <<Prev/binary, Info/binary, I>>),
     expand_loop(Hash, PRK, Info, N, I + 1, T, <<Acc/binary, T/binary>>).
-
-hash_len(sha256) -> 32;
-hash_len(sha384) -> 48;
-hash_len(sha512) -> 64.
 
 ceiling(X, Y) ->
     (X + Y - 1) div Y.

@@ -70,6 +70,7 @@
 
     %% Cipher to hash mapping
     cipher_to_hash/1,
+    hash_len/1,
 
     %% ECDHE
     generate_key_pair/1,

@@ -368,17 +368,21 @@ encode_tp(Id, Value) ->
 %% @doc Decode QUIC transport parameters.
 -spec decode_transport_params(binary()) -> {ok, map()} | {error, term()}.
 decode_transport_params(Data) ->
-    decode_transport_params(Data, #{}).
+    try
+        decode_transport_params_loop(Data, #{})
+    catch
+        error:_ -> {error, invalid_transport_params}
+    end.
 
-decode_transport_params(<<>>, Acc) ->
+decode_transport_params_loop(<<>>, Acc) ->
     {ok, Acc};
-decode_transport_params(Data, Acc) ->
+decode_transport_params_loop(Data, Acc) ->
     {Id, Rest1} = quic_varint:decode(Data),
     {Len, Rest2} = quic_varint:decode(Rest1),
     <<Value:Len/binary, Rest3/binary>> = Rest2,
     Key = tp_id_to_key(Id),
     DecodedValue = decode_tp_value(Id, Value),
-    decode_transport_params(Rest3, maps:put(Key, DecodedValue, Acc)).
+    decode_transport_params_loop(Rest3, maps:put(Key, DecodedValue, Acc)).
 
 tp_id_to_key(?TP_ORIGINAL_DCID) -> original_dcid;
 tp_id_to_key(?TP_MAX_IDLE_TIMEOUT) -> max_idle_timeout;

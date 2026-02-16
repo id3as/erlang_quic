@@ -19,7 +19,6 @@
 %%%   <li>`{quic, ConnRef, {stream_opened, StreamId}}' - Stream opened</li>
 %%%   <li>`{quic, ConnRef, {closed, Reason}}' - Connection closed</li>
 %%%   <li>`{quic, ConnRef, {transport_error, Code, Reason}}' - Transport error</li>
-%%%   <li>`{quic, ConnRef, {stream_headers, StreamId, Headers, Fin}}' - Headers received</li>
 %%%   <li>`{quic, ConnRef, {stream_data, StreamId, Bin, Fin}}' - Data received</li>
 %%%   <li>`{quic, ConnRef, {stream_reset, StreamId, ErrorCode}}' - Stream reset</li>
 %%%   <li>`{quic, ConnRef, {stop_sending, StreamId, ErrorCode}}' - Stop sending</li>
@@ -37,7 +36,6 @@
     close/2,
     open_stream/1,
     open_unidirectional_stream/1,
-    send_headers/4,
     send_data/4,
     reset_stream/3,
     handle_timeout/2,
@@ -148,24 +146,6 @@ open_unidirectional_stream(ConnRef) when is_reference(ConnRef) ->
     end;
 open_unidirectional_stream(ConnPid) when is_pid(ConnPid) ->
     quic_connection:open_unidirectional_stream(ConnPid).
-
-%% @doc Send HTTP/3 headers on a stream.
-%% Headers should be [{Name, Value}] with binary keys/values.
-%% Fin indicates if this is the final frame on the stream.
--spec send_headers(ConnRef, StreamId, Headers, Fin) -> ok | {error, term()}
-    when ConnRef :: reference() | pid(),
-         StreamId :: non_neg_integer(),
-         Headers :: [{binary(), binary()}],
-         Fin :: boolean().
-send_headers(ConnRef, StreamId, Headers, Fin) when is_reference(ConnRef) ->
-    case quic_connection:lookup(ConnRef) of
-        {ok, Pid} -> quic_connection:send_headers(Pid, StreamId, Headers, Fin);
-        error -> {error, not_found}
-    end;
-send_headers(ConnPid, StreamId, Headers, Fin) when is_pid(ConnPid) ->
-    quic_connection:send_headers(ConnPid, StreamId, Headers, Fin);
-send_headers(_ConnRef, _StreamId, _Headers, _Fin) ->
-    {error, badarg}.
 
 %% @doc Send data on a stream.
 %% Fin indicates if this is the final frame on the stream.

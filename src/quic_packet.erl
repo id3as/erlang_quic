@@ -61,6 +61,11 @@
 -type packet_type() :: initial | handshake | zero_rtt | one_rtt | retry.
 -type packet() :: #quic_packet{}.
 
+%% RFC 9000: Connection IDs MUST NOT exceed 20 bytes
+-define(MAX_CID_LEN, 20).
+%% RFC 9000: Maximum token length (practical limit)
+-define(MAX_TOKEN_LEN, 512).
+
 %%====================================================================
 %% API
 %%====================================================================
@@ -188,31 +193,49 @@ pn_length(_) -> 4.
 %% Internal Functions
 %%====================================================================
 
-decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>) ->
-    <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
-    <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
-    Type = bits_to_type((FirstByte bsr 4) band 2#11),
-    PNLenBits = FirstByte band 2#11,
-    PNLen = PNLenBits + 1,
+decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>)
+  when DCIDLen =< ?MAX_CID_LEN ->
+    case Rest of
+        <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>>
+          when SCIDLen =< ?MAX_CID_LEN ->
+            <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
+            Type = bits_to_type((FirstByte bsr 4) band 2#11),
+            PNLenBits = FirstByte band 2#11,
+            PNLen = PNLenBits + 1,
+            decode_long_body(Type, Version, DCID, SCID, PNLen, Rest3);
+        _ ->
+            {error, invalid_cid_length}
+    end;
+decode_long(<<_FirstByte, _Version:32, DCIDLen, _Rest/binary>>)
+  when DCIDLen > ?MAX_CID_LEN ->
+    {error, invalid_cid_length};
+decode_long(_) ->
+    {error, invalid_packet}.
 
+decode_long_body(Type, Version, DCID, SCID, PNLen, Rest3) ->
     case Type of
         initial ->
             {TokenLen, Rest4} = quic_varint:decode(Rest3),
-            <<Token:TokenLen/binary, Rest5/binary>> = Rest4,
-            {PayloadLen, Rest6} = quic_varint:decode(Rest5),
-            {PN, Rest7} = decode_pn(Rest6, PNLen),
-            PayloadSize = PayloadLen - PNLen,
-            <<Payload:PayloadSize/binary, Rest8/binary>> = Rest7,
-            Packet = #quic_packet{
-                type = initial,
-                version = Version,
-                dcid = DCID,
-                scid = SCID,
-                token = Token,
-                pn = PN,
-                payload = Payload
-            },
-            {ok, Packet, Rest8};
+            case TokenLen > ?MAX_TOKEN_LEN of
+                true ->
+                    {error, token_too_large};
+                false ->
+                    <<Token:TokenLen/binary, Rest5/binary>> = Rest4,
+                    {PayloadLen, Rest6} = quic_varint:decode(Rest5),
+                    {PN, Rest7} = decode_pn(Rest6, PNLen),
+                    PayloadSize = PayloadLen - PNLen,
+                    <<Payload:PayloadSize/binary, Rest8/binary>> = Rest7,
+                    Packet = #quic_packet{
+                        type = initial,
+                        version = Version,
+                        dcid = DCID,
+                        scid = SCID,
+                        token = Token,
+                        pn = PN,
+                        payload = Payload
+                    },
+                    {ok, Packet, Rest8}
+            end;
         handshake ->
             {PayloadLen, Rest4} = quic_varint:decode(Rest3),
             {PN, Rest5} = decode_pn(Rest4, PNLen),
@@ -251,9 +274,7 @@ decode_long(<<FirstByte, Version:32, DCIDLen, Rest/binary>>) ->
                 payload = Rest3
             },
             {ok, Packet, <<>>}
-    end;
-decode_long(_) ->
-    {error, invalid_packet}.
+    end.
 
 decode_short(<<FirstByte, Rest/binary>>, DCIDLen) ->
     <<DCID:DCIDLen/binary, Rest2/binary>> = Rest,

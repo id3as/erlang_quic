@@ -100,7 +100,7 @@ clear_expired(Store) ->
 %%   resumption_master_secret = Derive-Secret(Master Secret, "res master", ClientHello..client Finished)
 -spec derive_resumption_secret(atom(), binary(), binary(), binary()) -> binary().
 derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) ->
-    Hash = cipher_to_hash(Cipher),
+    Hash = quic_crypto:cipher_to_hash(Cipher),
     quic_crypto:derive_secret(Hash, MasterSecret, <<"res master">>, TranscriptHash).
 
 %% @doc Derive PSK from resumption_master_secret and ticket nonce.
@@ -108,8 +108,8 @@ derive_resumption_secret(Cipher, MasterSecret, TranscriptHash, _ClientFinished) 
 %%   PSK = HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)
 -spec derive_psk(binary(), #session_ticket{}) -> binary().
 derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
-    Hash = cipher_to_hash(Cipher),
-    HashLen = hash_len(Hash),
+    Hash = quic_crypto:cipher_to_hash(Cipher),
+    HashLen = quic_crypto:hash_len(Hash),
     quic_hkdf:expand_label(Hash, ResumptionSecret, <<"resumption">>, Nonce, HashLen).
 
 %%====================================================================
@@ -175,11 +175,13 @@ parse_early_data_extension(_) ->
 -spec create_ticket(binary(), binary(), non_neg_integer(), atom(), binary() | undefined) ->
     #session_ticket{}.
 create_ticket(ServerName, ResumptionSecret, MaxEarlyData, Cipher, ALPN) ->
+    %% Use crypto:strong_rand_bytes for age_add to prevent replay attacks
+    <<AgeAdd:32>> = crypto:strong_rand_bytes(4),
     #session_ticket{
         server_name = ServerName,
         ticket = crypto:strong_rand_bytes(32),
         lifetime = 86400,  % 24 hours
-        age_add = rand:uniform(16#FFFFFFFF),
+        age_add = AgeAdd,
         nonce = crypto:strong_rand_bytes(8),
         resumption_secret = ResumptionSecret,
         max_early_data = MaxEarlyData,
@@ -210,13 +212,3 @@ build_new_session_ticket(#session_ticket{
     <<Lifetime:32, AgeAdd:32, NonceLen, Nonce/binary,
       TicketLen:16, Ticket/binary, ExtLen:16, Extensions/binary>>.
 
-%%====================================================================
-%% Internal Functions
-%%====================================================================
-
-cipher_to_hash(aes_128_gcm) -> sha256;
-cipher_to_hash(aes_256_gcm) -> sha384;
-cipher_to_hash(chacha20_poly1305) -> sha256.
-
-hash_len(sha256) -> 32;
-hash_len(sha384) -> 48.
