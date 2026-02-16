@@ -36,7 +36,10 @@
     derive_initial_server/1,
     derive_initial_server/2,
     derive_keys/2,
-    derive_traffic_keys/1
+    derive_traffic_keys/1,
+    %% Key Update (RFC 9001 Section 6)
+    derive_updated_secret/2,
+    derive_updated_keys/2
 ]).
 
 -export_type([keys/0]).
@@ -113,6 +116,28 @@ derive_keys(Secret, chacha20_poly1305) ->
 -spec derive_traffic_keys(binary()) -> keys().
 derive_traffic_keys(Secret) ->
     derive_keys(Secret, aes_128_gcm).
+
+%% @doc Derive an updated application secret for key update (RFC 9001 Section 6).
+%% The next application secret is computed as:
+%%   updated_secret = HKDF-Expand-Label(current_secret, "quic ku", "", hash_len)
+%% where "quic ku" is the label for key update.
+-spec derive_updated_secret(binary(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) -> binary().
+derive_updated_secret(CurrentSecret, aes_256_gcm) ->
+    %% AES-256-GCM uses SHA-384, so secret length is 48 bytes
+    quic_hkdf:expand_label(sha384, CurrentSecret, <<"quic ku">>, <<>>, 48);
+derive_updated_secret(CurrentSecret, _Cipher) ->
+    %% AES-128-GCM and ChaCha20-Poly1305 use SHA-256, so secret length is 32 bytes
+    quic_hkdf:expand_label(sha256, CurrentSecret, <<"quic ku">>, <<>>, 32).
+
+%% @doc Derive updated keys from an updated application secret.
+%% This performs the full key update: derives the new secret and then derives keys.
+%% Returns {UpdatedSecret, {Key, IV, HP}}.
+-spec derive_updated_keys(binary(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) ->
+    {UpdatedSecret :: binary(), keys()}.
+derive_updated_keys(CurrentSecret, Cipher) ->
+    UpdatedSecret = derive_updated_secret(CurrentSecret, Cipher),
+    Keys = derive_keys(UpdatedSecret, Cipher),
+    {UpdatedSecret, Keys}.
 
 %%====================================================================
 %% Internal Functions

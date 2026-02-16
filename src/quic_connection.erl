@@ -49,6 +49,7 @@
     send_data/4,
     send_headers/4,
     open_stream/1,
+    open_unidirectional_stream/1,
     close/2,
     close_stream/3,
     reset_stream/3,
@@ -57,7 +58,9 @@
     get_state/1,
     peername/1,
     sockname/1,
-    setopts/2
+    setopts/2,
+    %% Key update (RFC 9001 Section 6)
+    key_update/1
 ]).
 
 %% gen_statem callbacks
@@ -113,7 +116,10 @@
     %% Encryption keys per level
     initial_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
     handshake_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
-    app_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
+    app_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,  % Convenience accessor (= key_state.current_keys)
+
+    %% Key update state (RFC 9001 Section 6)
+    key_state :: #key_update_state{} | undefined,
 
     %% TLS state
     tls_state :: atom(),
@@ -265,6 +271,11 @@ send_headers(Conn, StreamId, Headers, Fin) ->
 open_stream(Conn) ->
     gen_statem:call(Conn, open_stream).
 
+%% @doc Open a new unidirectional stream.
+-spec open_unidirectional_stream(pid()) -> {ok, non_neg_integer()} | {error, term()}.
+open_unidirectional_stream(Conn) ->
+    gen_statem:call(Conn, open_unidirectional_stream).
+
 %% @doc Close the connection.
 -spec close(pid(), term()) -> ok.
 close(Conn, Reason) ->
@@ -311,6 +322,13 @@ sockname(Conn) ->
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
 setopts(Conn, Opts) ->
     gen_statem:call(Conn, {setopts, Opts}).
+
+%% @doc Initiate a key update (RFC 9001 Section 6).
+%% This triggers a key update cycle, deriving new encryption keys.
+%% Only valid when connection is in connected state.
+-spec key_update(pid()) -> ok | {error, term()}.
+key_update(Conn) ->
+    gen_statem:call(Conn, key_update).
 
 %%====================================================================
 %% gen_statem callbacks
@@ -532,6 +550,14 @@ connected({call, From}, open_stream, State) ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
 
+connected({call, From}, open_unidirectional_stream, State) ->
+    case do_open_unidirectional_stream(State) of
+        {ok, StreamId, NewState} ->
+            {keep_state, NewState, [{reply, From, {ok, StreamId}}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
 connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
@@ -542,6 +568,19 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
 
 connected({call, From}, {setopts, _Opts}, State) ->
     {keep_state, State, [{reply, From, ok}]};
+
+connected({call, From}, key_update, #state{key_state = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, no_keys}}]};
+connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
+    case KeyState#key_update_state.update_state of
+        idle ->
+            %% Initiate key update
+            NewState = initiate_key_update(State),
+            {keep_state, NewState, [{reply, From, ok}]};
+        _ ->
+            %% Key update already in progress
+            {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
+    end;
 
 connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -849,9 +888,12 @@ send_app_packet_internal(Payload, Frames, State) ->
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
 
+    %% Get current key phase for encoding
+    KeyPhase = get_current_key_phase(State),
+
     %% First byte for short header: 01XX XXXX
-    %% Bit 5 = spin bit (0), bits 3-4 reserved (0), bit 2 = key phase (0), bits 0-1 = PN length
-    FirstByte = 16#40 bor (PNLen - 1),
+    %% Bit 5 = spin bit (0), bits 3-4 reserved (0), bit 2 = key phase, bits 0-1 = PN length
+    FirstByte = 16#40 bor (KeyPhase bsl 2) bor (PNLen - 1),
 
     %% Header is just first byte + DCID
     Header = <<FirstByte, DCID/binary>>,
@@ -1012,7 +1054,46 @@ decode_short_header_packet(Data, State) ->
             <<FirstByte, DCID:DCIDLen/binary, EncryptedPayload/binary>> = Data,
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
-            decrypt_packet(app, Header, FirstByte, EncryptedPayload, <<>>, ServerKeys, State)
+            %% For key update support, we use the current server keys for HP removal
+            %% and then check key_phase after unprotection
+            decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State)
+    end.
+
+%% Decrypt an application (1-RTT) packet with key phase handling
+decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State) ->
+    #crypto_keys{hp = HP} = ServerKeys,
+
+    %% Remove header protection using current keys
+    PNOffset = byte_size(Header),
+    {UnprotectedHeader, PNLen} = quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset),
+
+    %% Extract the unprotected first byte to get key_phase
+    <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
+    ReceivedKeyPhase = quic_packet:decode_short_key_phase(UnprotectedFirstByte),
+
+    %% Select appropriate decryption keys based on key_phase
+    {DecryptKeys, State1} = select_decrypt_keys(ReceivedKeyPhase, State),
+    {_, ServerDecryptKeys} = DecryptKeys,
+
+    %% Extract PN and decrypt
+    UnprotHeaderLen = byte_size(UnprotectedHeader),
+    <<_:((UnprotHeaderLen - PNLen) * 8), PN:PNLen/unit:8>> = UnprotectedHeader,
+    AAD = UnprotectedHeader,
+    Ciphertext = binary:part(EncryptedPayload, PNLen, byte_size(EncryptedPayload) - PNLen),
+
+    #crypto_keys{key = Key, iv = IV} = ServerDecryptKeys,
+    case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of
+        {ok, Plaintext} ->
+            case quic_frame:decode_all(Plaintext) of
+                {ok, Frames} ->
+                    State2 = record_received_pn(app, PN, State1),
+                    NewState = update_last_activity(State2),
+                    {ok, app, Frames, <<>>, NewState};
+                {error, Reason} ->
+                    {error, {frame_decode_error, Reason}}
+            end;
+        {error, bad_tag} ->
+            {error, decryption_failed}
     end.
 
 %% Decrypt a packet
@@ -1343,6 +1424,16 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg, State) ->
                     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
                     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
 
+                    %% Initialize key update state with app secrets for future key updates
+                    KeyState = #key_update_state{
+                        current_phase = 0,
+                        current_keys = {ClientAppKeys, ServerAppKeys},
+                        prev_keys = undefined,
+                        client_app_secret = ClientAppSecret,
+                        server_app_secret = ServerAppSecret,
+                        update_state = idle
+                    },
+
                     %% Send client Finished (cipher-aware)
                     %% Client Finished uses transcript INCLUDING server Finished (RFC 8446 Section 4.4.4)
                     ClientFinishedKey = quic_crypto:derive_finished_key(Cipher, State#state.client_hs_secret),
@@ -1354,7 +1445,8 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg, State) ->
                         tls_state = ?TLS_HANDSHAKE_COMPLETE,
                         tls_transcript = <<Transcript/binary, ClientFinishedMsg/binary>>,
                         master_secret = MasterSecret,
-                        app_keys = {ClientAppKeys, ServerAppKeys}
+                        app_keys = {ClientAppKeys, ServerAppKeys},
+                        key_state = KeyState
                     },
 
                     %% Send client Finished in Handshake packet
@@ -1577,6 +1669,38 @@ do_open_stream(#state{next_stream_id_bidi = NextId,
             },
             NewState = State#state{
                 next_stream_id_bidi = NextId + 4,
+                streams = maps:put(NextId, StreamState, Streams)
+            },
+            {ok, NextId, NewState}
+    end.
+
+%% Open a new unidirectional stream
+do_open_unidirectional_stream(#state{next_stream_id_uni = NextId,
+                                      max_streams_uni_remote = Max,
+                                      streams = Streams} = State) ->
+    StreamCount = maps:size(maps:filter(fun(Id, _) ->
+        (Id band 16#03) =:= 2  % Client-initiated uni
+    end, Streams)),
+    if
+        StreamCount >= Max ->
+            {error, stream_limit};
+        true ->
+            %% Unidirectional streams are send-only for the initiator
+            StreamState = #stream_state{
+                id = NextId,
+                state = open,
+                send_offset = 0,
+                send_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                send_fin = false,
+                send_buffer = [],
+                recv_offset = 0,
+                recv_max_data = 0,  % We don't receive on our uni streams
+                recv_fin = true,    % No incoming data expected
+                recv_buffer = <<>>,
+                final_size = undefined
+            },
+            NewState = State#state{
+                next_stream_id_uni = NextId + 4,
                 streams = maps:put(NextId, StreamState, Streams)
             },
             {ok, NextId, NewState}
@@ -1838,3 +1962,165 @@ normalize_alpn_list([H|_] = L) when is_atom(H) ->
     [atom_to_binary(A, utf8) || A <- L];
 normalize_alpn_list(_) ->
     [].
+
+%%====================================================================
+%% Key Update (RFC 9001 Section 6)
+%%====================================================================
+
+%% @doc Initiate a key update.
+%% Derives new application secrets and keys, switches to the new key phase.
+initiate_key_update(#state{key_state = KeyState} = State) ->
+    #key_update_state{
+        current_phase = CurrentPhase,
+        current_keys = CurrentKeys,
+        client_app_secret = ClientSecret,
+        server_app_secret = ServerSecret
+    } = KeyState,
+
+    %% Get cipher from current keys
+    {ClientKeys, _} = CurrentKeys,
+    Cipher = ClientKeys#crypto_keys.cipher,
+
+    %% Derive new secrets using "quic ku" label
+    {NewClientSecret, {NewClientKey, NewClientIV, NewClientHP}} =
+        quic_keys:derive_updated_keys(ClientSecret, Cipher),
+    {NewServerSecret, {NewServerKey, NewServerIV, NewServerHP}} =
+        quic_keys:derive_updated_keys(ServerSecret, Cipher),
+
+    %% Create new crypto_keys records
+    NewClientKeys = #crypto_keys{
+        key = NewClientKey,
+        iv = NewClientIV,
+        hp = NewClientHP,
+        cipher = Cipher
+    },
+    NewServerKeys = #crypto_keys{
+        key = NewServerKey,
+        iv = NewServerIV,
+        hp = NewServerHP,
+        cipher = Cipher
+    },
+
+    %% Toggle key phase
+    NewPhase = 1 - CurrentPhase,
+
+    %% Update key state
+    NewKeyState = KeyState#key_update_state{
+        current_phase = NewPhase,
+        current_keys = {NewClientKeys, NewServerKeys},
+        prev_keys = CurrentKeys,  % Keep old keys for decryption during transition
+        client_app_secret = NewClientSecret,
+        server_app_secret = NewServerSecret,
+        update_state = initiated
+    },
+
+    State#state{
+        app_keys = {NewClientKeys, NewServerKeys},
+        key_state = NewKeyState
+    }.
+
+%% @doc Handle receiving a packet with a different key phase.
+%% This is called when we receive a packet with a key phase that differs
+%% from our current phase, indicating the peer has initiated a key update.
+handle_peer_key_update(#state{key_state = KeyState} = State) ->
+    #key_update_state{
+        current_phase = CurrentPhase,
+        current_keys = CurrentKeys,
+        client_app_secret = ClientSecret,
+        server_app_secret = ServerSecret,
+        update_state = UpdateState
+    } = KeyState,
+
+    case UpdateState of
+        initiated ->
+            %% We initiated, peer responded - complete the update
+            NewKeyState = KeyState#key_update_state{
+                prev_keys = undefined,
+                update_state = idle
+            },
+            State#state{key_state = NewKeyState};
+        idle ->
+            %% Peer initiated - we need to respond by deriving new keys
+            {ClientKeys, _} = CurrentKeys,
+            Cipher = ClientKeys#crypto_keys.cipher,
+
+            %% Derive new secrets
+            {NewClientSecret, {NewClientKey, NewClientIV, NewClientHP}} =
+                quic_keys:derive_updated_keys(ClientSecret, Cipher),
+            {NewServerSecret, {NewServerKey, NewServerIV, NewServerHP}} =
+                quic_keys:derive_updated_keys(ServerSecret, Cipher),
+
+            NewClientKeys = #crypto_keys{
+                key = NewClientKey,
+                iv = NewClientIV,
+                hp = NewClientHP,
+                cipher = Cipher
+            },
+            NewServerKeys = #crypto_keys{
+                key = NewServerKey,
+                iv = NewServerIV,
+                hp = NewServerHP,
+                cipher = Cipher
+            },
+
+            NewPhase = 1 - CurrentPhase,
+            NewKeyState = KeyState#key_update_state{
+                current_phase = NewPhase,
+                current_keys = {NewClientKeys, NewServerKeys},
+                prev_keys = CurrentKeys,
+                client_app_secret = NewClientSecret,
+                server_app_secret = NewServerSecret,
+                update_state = responding
+            },
+            State#state{
+                app_keys = {NewClientKeys, NewServerKeys},
+                key_state = NewKeyState
+            };
+        responding ->
+            %% Already responding, just continue
+            State
+    end.
+
+%% @doc Complete a key update after receiving an ACK for a packet with new keys.
+%% Discards the previous keys.
+complete_key_update(#state{key_state = KeyState} = State) ->
+    NewKeyState = KeyState#key_update_state{
+        prev_keys = undefined,
+        update_state = idle
+    },
+    State#state{key_state = NewKeyState}.
+
+%% @doc Select the appropriate keys for decryption based on the received key phase.
+%% Returns {Keys, State} where State may be updated if a key update is detected.
+select_decrypt_keys(_ReceivedKeyPhase, #state{key_state = undefined} = State) ->
+    %% No key state yet, use app_keys directly (should not happen in practice)
+    {State#state.app_keys, State};
+select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
+    #key_update_state{
+        current_phase = CurrentPhase,
+        current_keys = CurrentKeys,
+        prev_keys = PrevKeys
+    } = KeyState,
+
+    case ReceivedKeyPhase of
+        CurrentPhase ->
+            %% Same phase, use current keys
+            {CurrentKeys, State};
+        _ ->
+            %% Different phase - could be peer initiating update or using prev keys
+            case PrevKeys of
+                undefined ->
+                    %% No previous keys, peer is initiating update
+                    %% Handle the key update and decrypt with new keys
+                    State1 = handle_peer_key_update(State),
+                    {State1#state.key_state#key_update_state.current_keys, State1};
+                _ ->
+                    %% Try previous keys (during transition period)
+                    {PrevKeys, State}
+            end
+    end.
+
+%% @doc Get the current key phase for sending.
+get_current_key_phase(#state{key_state = undefined}) -> 0;
+get_current_key_phase(#state{key_state = KeyState}) ->
+    KeyState#key_update_state.current_phase.

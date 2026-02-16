@@ -147,6 +147,62 @@ quic_v2_different_from_v1_test() ->
     ?assertNotEqual(KeysV1, KeysV2).
 
 %%====================================================================
+%% Key Update Tests (RFC 9001 Section 6)
+%%====================================================================
+
+%% Test that derive_updated_secret returns a different secret
+derive_updated_secret_aes_128_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    UpdatedSecret = quic_keys:derive_updated_secret(Secret, aes_128_gcm),
+    ?assertEqual(32, byte_size(UpdatedSecret)),
+    ?assertNotEqual(Secret, UpdatedSecret).
+
+%% Test key update with AES-256-GCM (uses SHA-384)
+derive_updated_secret_aes_256_test() ->
+    Secret = crypto:strong_rand_bytes(48),  % SHA-384 produces 48-byte secrets
+    UpdatedSecret = quic_keys:derive_updated_secret(Secret, aes_256_gcm),
+    ?assertEqual(48, byte_size(UpdatedSecret)),
+    ?assertNotEqual(Secret, UpdatedSecret).
+
+%% Test that key update is deterministic
+derive_updated_secret_deterministic_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    Updated1 = quic_keys:derive_updated_secret(Secret, aes_128_gcm),
+    Updated2 = quic_keys:derive_updated_secret(Secret, aes_128_gcm),
+    ?assertEqual(Updated1, Updated2).
+
+%% Test derive_updated_keys returns both secret and keys
+derive_updated_keys_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    {UpdatedSecret, {Key, IV, HP}} = quic_keys:derive_updated_keys(Secret, aes_128_gcm),
+    ?assertEqual(32, byte_size(UpdatedSecret)),
+    ?assertEqual(16, byte_size(Key)),
+    ?assertEqual(12, byte_size(IV)),
+    ?assertEqual(16, byte_size(HP)).
+
+%% Test key update chain - derive multiple generations
+key_update_chain_test() ->
+    Secret0 = crypto:strong_rand_bytes(32),
+    {Secret1, _Keys1} = quic_keys:derive_updated_keys(Secret0, aes_128_gcm),
+    {Secret2, _Keys2} = quic_keys:derive_updated_keys(Secret1, aes_128_gcm),
+    {Secret3, _Keys3} = quic_keys:derive_updated_keys(Secret2, aes_128_gcm),
+
+    %% All secrets should be different
+    ?assertNotEqual(Secret0, Secret1),
+    ?assertNotEqual(Secret1, Secret2),
+    ?assertNotEqual(Secret2, Secret3),
+    ?assertNotEqual(Secret0, Secret3).
+
+%% Test ChaCha20-Poly1305 key update
+derive_updated_secret_chacha20_test() ->
+    Secret = crypto:strong_rand_bytes(32),
+    {UpdatedSecret, {Key, IV, HP}} = quic_keys:derive_updated_keys(Secret, chacha20_poly1305),
+    ?assertEqual(32, byte_size(UpdatedSecret)),
+    ?assertEqual(32, byte_size(Key)),
+    ?assertEqual(12, byte_size(IV)),
+    ?assertEqual(32, byte_size(HP)).
+
+%%====================================================================
 %% Helper Functions
 %%====================================================================
 

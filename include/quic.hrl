@@ -150,6 +150,7 @@
 -define(QUIC_LABEL_QUIC_KEY, <<"quic key">>).
 -define(QUIC_LABEL_QUIC_IV, <<"quic iv">>).
 -define(QUIC_LABEL_QUIC_HP, <<"quic hp">>).
+-define(QUIC_LABEL_QUIC_KU, <<"quic ku">>).
 
 %%====================================================================
 %% TLS 1.3 Message Types (RFC 8446 Section 4)
@@ -244,6 +245,31 @@
     iv :: binary(),
     hp :: binary(),
     cipher :: aes_128_gcm | aes_256_gcm | chacha20_poly1305
+}).
+
+%% Key Update State (RFC 9001 Section 6)
+%% Tracks the key phase and keys for 1-RTT packet encryption.
+%% Maintains both current and previous keys for decryption during key update.
+-record(key_update_state, {
+    %% Current key phase (0 or 1), toggles on each key update
+    current_phase = 0 :: 0 | 1,
+
+    %% Current keys for sending and receiving
+    current_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
+
+    %% Previous keys for decryption (kept during key update transition)
+    %% Set to undefined when no key update is in progress
+    prev_keys :: {#crypto_keys{}, #crypto_keys{}} | undefined,
+
+    %% Application traffic secrets (needed for deriving next keys)
+    client_app_secret :: binary() | undefined,
+    server_app_secret :: binary() | undefined,
+
+    %% Key update state machine
+    %% idle: normal operation, no key update in progress
+    %% initiated: we sent a packet with new key phase, awaiting response
+    %% responding: we received a packet with new key phase, transitioning
+    update_state = idle :: idle | initiated | responding
 }).
 
 %% Stream state

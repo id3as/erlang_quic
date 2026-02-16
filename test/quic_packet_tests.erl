@@ -228,6 +228,89 @@ empty_scid_test() ->
     ?assertEqual(<<>>, Packet#quic_packet.scid).
 
 %%====================================================================
+%% Key Phase Tests (RFC 9001 Section 6)
+%%====================================================================
+
+%% Test encoding short header with key phase 0
+encode_short_key_phase_0_test() ->
+    DCID = <<1,2,3,4,5,6,7,8>>,
+    Payload = <<"data">>,
+    PN = 0,
+
+    Encoded = quic_packet:encode_short(DCID, PN, Payload, false, 0),
+
+    %% Verify key phase bit is 0 (bit 2)
+    <<FirstByte, _/binary>> = Encoded,
+    KeyPhase = quic_packet:decode_short_key_phase(FirstByte),
+    ?assertEqual(0, KeyPhase).
+
+%% Test encoding short header with key phase 1
+encode_short_key_phase_1_test() ->
+    DCID = <<1,2,3,4,5,6,7,8>>,
+    Payload = <<"data">>,
+    PN = 0,
+
+    Encoded = quic_packet:encode_short(DCID, PN, Payload, false, 1),
+
+    %% Verify key phase bit is 1 (bit 2)
+    <<FirstByte, _/binary>> = Encoded,
+    KeyPhase = quic_packet:decode_short_key_phase(FirstByte),
+    ?assertEqual(1, KeyPhase).
+
+%% Test decode_short_key_phase extracts the correct bit
+decode_short_key_phase_test() ->
+    %% First byte format: 0 | 1 | S | R | R | K | P P
+    %% Key phase is bit 2, so:
+    %% 0100 0100 = 0x44 -> key phase 1
+    %% 0100 0000 = 0x40 -> key phase 0
+    ?assertEqual(0, quic_packet:decode_short_key_phase(16#40)),
+    ?assertEqual(1, quic_packet:decode_short_key_phase(16#44)),
+    %% With spin bit set
+    ?assertEqual(0, quic_packet:decode_short_key_phase(16#60)),  % 0110 0000
+    ?assertEqual(1, quic_packet:decode_short_key_phase(16#64)).  % 0110 0100
+
+%% Test that 4-arity encode_short is backward compatible (uses key phase 0)
+encode_short_backward_compatible_test() ->
+    DCID = <<1,2,3,4,5,6,7,8>>,
+    Payload = <<"data">>,
+    PN = 0,
+
+    %% 4-arity should produce same result as 5-arity with key_phase=0
+    Encoded4 = quic_packet:encode_short(DCID, PN, Payload, false),
+    Encoded5 = quic_packet:encode_short(DCID, PN, Payload, false, 0),
+    ?assertEqual(Encoded4, Encoded5).
+
+%% Test key phase and spin bit are independent
+key_phase_and_spin_bit_independent_test() ->
+    DCID = <<1,2,3,4>>,
+    Payload = <<"data">>,
+    PN = 0,
+
+    %% Test all combinations
+    Encoded00 = quic_packet:encode_short(DCID, PN, Payload, false, 0),
+    Encoded01 = quic_packet:encode_short(DCID, PN, Payload, false, 1),
+    Encoded10 = quic_packet:encode_short(DCID, PN, Payload, true, 0),
+    Encoded11 = quic_packet:encode_short(DCID, PN, Payload, true, 1),
+
+    %% Extract first bytes
+    <<FB00, _/binary>> = Encoded00,
+    <<FB01, _/binary>> = Encoded01,
+    <<FB10, _/binary>> = Encoded10,
+    <<FB11, _/binary>> = Encoded11,
+
+    %% Check spin bit (bit 5)
+    ?assertEqual(0, (FB00 bsr 5) band 1),
+    ?assertEqual(0, (FB01 bsr 5) band 1),
+    ?assertEqual(1, (FB10 bsr 5) band 1),
+    ?assertEqual(1, (FB11 bsr 5) band 1),
+
+    %% Check key phase (bit 2)
+    ?assertEqual(0, quic_packet:decode_short_key_phase(FB00)),
+    ?assertEqual(1, quic_packet:decode_short_key_phase(FB01)),
+    ?assertEqual(0, quic_packet:decode_short_key_phase(FB10)),
+    ?assertEqual(1, quic_packet:decode_short_key_phase(FB11)).
+
+%%====================================================================
 %% Error Cases
 %%====================================================================
 

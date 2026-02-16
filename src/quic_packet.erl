@@ -48,7 +48,9 @@
 -export([
     encode_long/5,
     encode_short/4,
+    encode_short/5,
     decode/2,
+    decode_short_key_phase/1,
     encode_pn/2,
     decode_pn/2,
     pn_length/1
@@ -118,21 +120,36 @@ encode_long(Type, Version, DCID, SCID, Opts) ->
               SCIDLen, SCID/binary, Payload/binary>>
     end.
 
-%% @doc Encode a short header (1-RTT) packet.
+%% @doc Encode a short header (1-RTT) packet with default key phase 0.
 %% DCIDLen is the expected DCID length (from connection state).
 %% Returns the encoded packet.
 -spec encode_short(binary(), non_neg_integer(), binary(), boolean()) -> binary().
 encode_short(DCID, PN, Payload, SpinBit) ->
+    encode_short(DCID, PN, Payload, SpinBit, 0).
+
+%% @doc Encode a short header (1-RTT) packet with explicit key phase.
+%% KeyPhase is 0 or 1, indicating which set of keys was used for encryption.
+%% Returns the encoded packet.
+-spec encode_short(binary(), non_neg_integer(), binary(), boolean(), 0 | 1) -> binary().
+encode_short(DCID, PN, Payload, SpinBit, KeyPhase) ->
     PNLen = pn_length(PN),
     PNLenBits = PNLen - 1,
 
     %% First byte: 0 | 1 | S | Reserved (2) | Key Phase | PN Len (2)
-    %% S = Spin bit, Key Phase = 0 for now
+    %% S = Spin bit (bit 5), Reserved (bits 3-4), Key Phase (bit 2), PN Len (bits 0-1)
     SpinBitVal = case SpinBit of true -> 1; false -> 0 end,
-    FirstByte = 2#01000000 bor (SpinBitVal bsl 5) bor PNLenBits,
+    KeyPhaseBit = KeyPhase band 1,
+    FirstByte = 2#01000000 bor (SpinBitVal bsl 5) bor (KeyPhaseBit bsl 2) bor PNLenBits,
 
     PNBin = encode_pn(PN, PNLen),
     <<FirstByte, DCID/binary, PNBin/binary, Payload/binary>>.
+
+%% @doc Extract the key phase bit from a short header first byte.
+%% The key phase bit is bit 2 of the first byte (after header protection removal).
+%% Returns 0 or 1.
+-spec decode_short_key_phase(non_neg_integer()) -> 0 | 1.
+decode_short_key_phase(FirstByte) ->
+    (FirstByte bsr 2) band 1.
 
 %% @doc Decode a QUIC packet.
 %% DCIDLen is used for short header packets where DCID length is implicit.

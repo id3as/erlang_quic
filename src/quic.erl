@@ -36,6 +36,7 @@
     connect/4,
     close/2,
     open_stream/1,
+    open_unidirectional_stream/1,
     send_headers/4,
     send_data/4,
     reset_stream/3,
@@ -134,6 +135,19 @@ open_stream(ConnRef) when is_reference(ConnRef) ->
     end;
 open_stream(ConnPid) when is_pid(ConnPid) ->
     quic_connection:open_stream(ConnPid).
+
+%% @doc Open a new unidirectional stream.
+%% Returns {ok, StreamId} on success.
+%% Unidirectional streams are send-only for the initiator.
+-spec open_unidirectional_stream(ConnRef) -> {ok, non_neg_integer()} | {error, term()}
+    when ConnRef :: reference() | pid().
+open_unidirectional_stream(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:open_unidirectional_stream(Pid);
+        error -> {error, not_found}
+    end;
+open_unidirectional_stream(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:open_unidirectional_stream(ConnPid).
 
 %% @doc Send HTTP/3 headers on a stream.
 %% Headers should be [{Name, Value}] with binary keys/values.
