@@ -80,7 +80,7 @@ get_fd(Socket) ->
     end.
 
 %% @doc Connect to a QUIC server.
-%% Returns {ok, ConnRef} on success.
+%% Returns {ok, ConnRef} on success where ConnRef is a reference().
 %% The owner process will receive {quic, ConnRef, {connected, Info}}
 %% when the connection is established.
 %%
@@ -101,7 +101,13 @@ connect(Host, Port, Opts, Owner) when is_list(Host) ->
 connect(Host, Port, Opts, Owner) when is_binary(Host), is_integer(Port),
                                        Port > 0, Port =< 65535,
                                        is_map(Opts), is_pid(Owner) ->
-    quic_connection:start_link(Host, Port, Opts, Owner);
+    case quic_connection:start_link(Host, Port, Opts, Owner) of
+        {ok, Pid} ->
+            ConnRef = gen_statem:call(Pid, get_ref),
+            {ok, ConnRef};
+        Error ->
+            Error
+    end;
 connect(_Host, _Port, _Opts, _Owner) ->
     {error, badarg}.
 

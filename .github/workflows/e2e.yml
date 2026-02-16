@@ -1,0 +1,71 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27.0'
+          rebar3-version: '3.23.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-e2e-otp27-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-e2e-otp27-
+
+      - name: Generate certificates
+        run: |
+          chmod +x ./certs/generate_certs.sh
+          ./certs/generate_certs.sh
+
+      - name: Build Docker image
+        run: docker compose -f docker/docker-compose.yml build
+
+      - name: Start QUIC server
+        run: |
+          docker compose -f docker/docker-compose.yml up -d
+          # Wait for server to be ready
+          for i in {1..30}; do
+            if docker compose -f docker/docker-compose.yml ps | grep -q "healthy"; then
+              echo "Server is healthy"
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 2
+          done
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Run E2E tests
+        run: rebar3 ct --suite=quic_e2e_SUITE
+        env:
+          QUIC_SERVER_HOST: 127.0.0.1
+          QUIC_SERVER_PORT: 4433
+
+      - name: Collect server logs
+        if: failure()
+        run: |
+          echo "=== QUIC Server Logs ==="
+          docker compose -f docker/docker-compose.yml logs quic-server
+
+      - name: Stop QUIC server
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v

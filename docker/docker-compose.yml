@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  quic-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.quic-server
+    ports:
+      - "4433:4433/udp"
+    volumes:
+      - ../certs:/certs:ro
+      - ./logs:/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 4433)); s.close()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: ["python", "quic_server.py", "--host", "0.0.0.0", "--port", "4433",
+              "--cert", "/certs/cert.pem", "--key", "/certs/priv.key",
+              "--secrets-log", "/logs/sslkeys.log", "-v"]
+    restart: unless-stopped

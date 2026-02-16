@@ -31,14 +31,21 @@
     %% Key Schedule
     derive_early_secret/0,
     derive_early_secret/1,
+    derive_early_secret/2,
     derive_handshake_secret/2,
+    derive_handshake_secret/3,
     derive_master_secret/1,
+    derive_master_secret/2,
 
     %% Traffic Secrets
     derive_client_handshake_secret/2,
+    derive_client_handshake_secret/3,
     derive_server_handshake_secret/2,
+    derive_server_handshake_secret/3,
     derive_client_app_secret/2,
+    derive_client_app_secret/3,
     derive_server_app_secret/2,
+    derive_server_app_secret/3,
 
     %% Derive-Secret function
     derive_secret/3,
@@ -46,10 +53,16 @@
 
     %% Finished key and verify data
     derive_finished_key/1,
+    derive_finished_key/2,
     compute_finished_verify/2,
+    compute_finished_verify/3,
 
     %% Transcript hash
     transcript_hash/1,
+    transcript_hash/2,
+
+    %% Cipher to hash mapping
+    cipher_to_hash/1,
 
     %% ECDHE
     generate_key_pair/1,
@@ -58,6 +71,7 @@
 
 %% Hash length for SHA-256
 -define(HASH_LEN, 32).
+-define(HASH_LEN_384, 48).
 
 %%====================================================================
 %% Key Schedule (RFC 8446 Section 7.1)
@@ -77,6 +91,14 @@ derive_early_secret(PSK) ->
     Salt = <<0:?HASH_LEN/unit:8>>,
     quic_hkdf:extract(Salt, PSK).
 
+%% @doc Derive early secret with cipher-specific hash.
+-spec derive_early_secret(atom(), binary()) -> binary().
+derive_early_secret(Cipher, PSK) ->
+    Hash = cipher_to_hash(Cipher),
+    HashLen = hash_len(Hash),
+    Salt = <<0:HashLen/unit:8>>,
+    quic_hkdf:extract(Hash, Salt, PSK).
+
 %% @doc Derive handshake secret from early secret and ECDHE shared secret.
 %% handshake_secret = HKDF-Extract(
 %%     Derive-Secret(early_secret, "derived", ""),
@@ -85,6 +107,13 @@ derive_early_secret(PSK) ->
 derive_handshake_secret(EarlySecret, SharedSecret) ->
     Salt = derive_secret(EarlySecret, <<"derived">>, <<>>),
     quic_hkdf:extract(Salt, SharedSecret).
+
+%% @doc Derive handshake secret with cipher-specific hash.
+-spec derive_handshake_secret(atom(), binary(), binary()) -> binary().
+derive_handshake_secret(Cipher, EarlySecret, SharedSecret) ->
+    Hash = cipher_to_hash(Cipher),
+    Salt = derive_secret(Hash, EarlySecret, <<"derived">>, <<>>),
+    quic_hkdf:extract(Hash, Salt, SharedSecret).
 
 %% @doc Derive master secret from handshake secret.
 %% master_secret = HKDF-Extract(
@@ -95,6 +124,15 @@ derive_master_secret(HandshakeSecret) ->
     Salt = derive_secret(HandshakeSecret, <<"derived">>, <<>>),
     IKM = <<0:?HASH_LEN/unit:8>>,
     quic_hkdf:extract(Salt, IKM).
+
+%% @doc Derive master secret with cipher-specific hash.
+-spec derive_master_secret(atom(), binary()) -> binary().
+derive_master_secret(Cipher, HandshakeSecret) ->
+    Hash = cipher_to_hash(Cipher),
+    HashLen = hash_len(Hash),
+    Salt = derive_secret(Hash, HandshakeSecret, <<"derived">>, <<>>),
+    IKM = <<0:HashLen/unit:8>>,
+    quic_hkdf:extract(Hash, Salt, IKM).
 
 %%====================================================================
 %% Traffic Secrets (RFC 8446 Section 7.1)
@@ -107,12 +145,24 @@ derive_master_secret(HandshakeSecret) ->
 derive_client_handshake_secret(HandshakeSecret, TranscriptHash) ->
     derive_secret(HandshakeSecret, <<"c hs traffic">>, TranscriptHash).
 
+%% @doc Derive client handshake traffic secret with cipher-specific hash.
+-spec derive_client_handshake_secret(atom(), binary(), binary()) -> binary().
+derive_client_handshake_secret(Cipher, HandshakeSecret, TranscriptHash) ->
+    Hash = cipher_to_hash(Cipher),
+    derive_secret(Hash, HandshakeSecret, <<"c hs traffic">>, TranscriptHash).
+
 %% @doc Derive server handshake traffic secret.
 %% server_handshake_traffic_secret = Derive-Secret(
 %%     handshake_secret, "s hs traffic", ClientHello...ServerHello)
 -spec derive_server_handshake_secret(binary(), binary()) -> binary().
 derive_server_handshake_secret(HandshakeSecret, TranscriptHash) ->
     derive_secret(HandshakeSecret, <<"s hs traffic">>, TranscriptHash).
+
+%% @doc Derive server handshake traffic secret with cipher-specific hash.
+-spec derive_server_handshake_secret(atom(), binary(), binary()) -> binary().
+derive_server_handshake_secret(Cipher, HandshakeSecret, TranscriptHash) ->
+    Hash = cipher_to_hash(Cipher),
+    derive_secret(Hash, HandshakeSecret, <<"s hs traffic">>, TranscriptHash).
 
 %% @doc Derive client application traffic secret.
 %% client_application_traffic_secret_0 = Derive-Secret(
@@ -121,12 +171,24 @@ derive_server_handshake_secret(HandshakeSecret, TranscriptHash) ->
 derive_client_app_secret(MasterSecret, TranscriptHash) ->
     derive_secret(MasterSecret, <<"c ap traffic">>, TranscriptHash).
 
+%% @doc Derive client application traffic secret with cipher-specific hash.
+-spec derive_client_app_secret(atom(), binary(), binary()) -> binary().
+derive_client_app_secret(Cipher, MasterSecret, TranscriptHash) ->
+    Hash = cipher_to_hash(Cipher),
+    derive_secret(Hash, MasterSecret, <<"c ap traffic">>, TranscriptHash).
+
 %% @doc Derive server application traffic secret.
 %% server_application_traffic_secret_0 = Derive-Secret(
 %%     master_secret, "s ap traffic", ClientHello...server Finished)
 -spec derive_server_app_secret(binary(), binary()) -> binary().
 derive_server_app_secret(MasterSecret, TranscriptHash) ->
     derive_secret(MasterSecret, <<"s ap traffic">>, TranscriptHash).
+
+%% @doc Derive server application traffic secret with cipher-specific hash.
+-spec derive_server_app_secret(atom(), binary(), binary()) -> binary().
+derive_server_app_secret(Cipher, MasterSecret, TranscriptHash) ->
+    Hash = cipher_to_hash(Cipher),
+    derive_secret(Hash, MasterSecret, <<"s ap traffic">>, TranscriptHash).
 
 %%====================================================================
 %% Derive-Secret Function
@@ -144,9 +206,11 @@ derive_secret(Secret, Label, Messages) ->
 derive_secret(Hash, Secret, Label, Messages) ->
     HashLen = hash_len(Hash),
     %% If Messages is already hash-length, assume it's pre-hashed
+    %% Otherwise, compute Transcript-Hash(Messages) = Hash(Messages)
+    %% RFC 8446: Even for empty Messages, use Hash("") not empty binary
     Context = case byte_size(Messages) of
         HashLen -> Messages;
-        _ -> transcript_hash(Messages)
+        _ -> transcript_hash(Hash, Messages)  % Includes empty case: Hash("")
     end,
     quic_hkdf:expand_label(Hash, Secret, Label, Context, HashLen).
 
@@ -160,20 +224,54 @@ derive_secret(Hash, Secret, Label, Messages) ->
 derive_finished_key(TrafficSecret) ->
     quic_hkdf:expand_label(TrafficSecret, <<"finished">>, <<>>, ?HASH_LEN).
 
+%% @doc Derive the finished key with cipher-specific hash.
+-spec derive_finished_key(atom(), binary()) -> binary().
+derive_finished_key(Cipher, TrafficSecret) ->
+    Hash = cipher_to_hash(Cipher),
+    HashLen = hash_len(Hash),
+    quic_hkdf:expand_label(Hash, TrafficSecret, <<"finished">>, <<>>, HashLen).
+
 %% @doc Compute the Finished verify_data.
 %% verify_data = HMAC(finished_key, Transcript-Hash(Handshake Context))
 -spec compute_finished_verify(binary(), binary()) -> binary().
 compute_finished_verify(FinishedKey, TranscriptHash) ->
     crypto:mac(hmac, sha256, FinishedKey, TranscriptHash).
 
+%% @doc Compute the Finished verify_data with cipher-specific hash.
+-spec compute_finished_verify(atom(), binary(), binary()) -> binary().
+compute_finished_verify(Cipher, FinishedKey, TranscriptHash) ->
+    Hash = cipher_to_hash(Cipher),
+    crypto:mac(hmac, Hash, FinishedKey, TranscriptHash).
+
 %%====================================================================
 %% Transcript Hash
 %%====================================================================
 
-%% @doc Compute transcript hash of handshake messages.
+%% @doc Compute transcript hash of handshake messages (default SHA-256).
 -spec transcript_hash(binary()) -> binary().
 transcript_hash(Messages) ->
     crypto:hash(sha256, Messages).
+
+%% @doc Compute transcript hash with specified hash algorithm or cipher.
+%% Accepts both hash atoms (sha256, sha384) and cipher atoms (aes_128_gcm, aes_256_gcm).
+-spec transcript_hash(atom(), binary()) -> binary().
+transcript_hash(HashOrCipher, Messages) ->
+    %% Always go through cipher_to_hash which passes through sha256/sha384 unchanged
+    Hash = cipher_to_hash(HashOrCipher),
+    crypto:hash(Hash, Messages).
+
+%%====================================================================
+%% Cipher to Hash Mapping
+%%====================================================================
+
+%% @doc Map cipher suite to corresponding hash algorithm.
+-spec cipher_to_hash(atom()) -> atom().
+cipher_to_hash(aes_128_gcm) -> sha256;
+cipher_to_hash(aes_256_gcm) -> sha384;
+cipher_to_hash(chacha20_poly1305) -> sha256;
+cipher_to_hash(sha256) -> sha256;  % Pass-through for hash atoms
+cipher_to_hash(sha384) -> sha384;
+cipher_to_hash(_) -> sha256.  % Default to SHA-256
 
 %%====================================================================
 %% ECDHE Key Exchange

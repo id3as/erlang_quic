@@ -152,6 +152,76 @@
 -define(QUIC_LABEL_QUIC_HP, <<"quic hp">>).
 
 %%====================================================================
+%% TLS 1.3 Message Types (RFC 8446 Section 4)
+%%====================================================================
+
+-define(TLS_CLIENT_HELLO, 1).
+-define(TLS_SERVER_HELLO, 2).
+-define(TLS_NEW_SESSION_TICKET, 4).
+-define(TLS_END_OF_EARLY_DATA, 5).
+-define(TLS_ENCRYPTED_EXTENSIONS, 8).
+-define(TLS_CERTIFICATE, 11).
+-define(TLS_CERTIFICATE_REQUEST, 13).
+-define(TLS_CERTIFICATE_VERIFY, 15).
+-define(TLS_FINISHED, 20).
+-define(TLS_KEY_UPDATE, 24).
+-define(TLS_MESSAGE_HASH, 254).
+
+%%====================================================================
+%% TLS 1.3 Extension Types (RFC 8446 Section 4.2)
+%%====================================================================
+
+-define(EXT_SERVER_NAME, 0).
+-define(EXT_SUPPORTED_GROUPS, 10).
+-define(EXT_SIGNATURE_ALGORITHMS, 13).
+-define(EXT_ALPN, 16).
+-define(EXT_SUPPORTED_VERSIONS, 43).
+-define(EXT_PSK_KEY_EXCHANGE_MODES, 45).
+-define(EXT_KEY_SHARE, 51).
+-define(EXT_QUIC_TRANSPORT_PARAMS, 57).
+
+%%====================================================================
+%% TLS 1.3 Named Groups (RFC 8446 Section 4.2.7)
+%%====================================================================
+
+-define(GROUP_SECP256R1, 16#0017).
+-define(GROUP_SECP384R1, 16#0018).
+-define(GROUP_SECP521R1, 16#0019).
+-define(GROUP_X25519, 16#001d).
+-define(GROUP_X448, 16#001e).
+
+%%====================================================================
+%% TLS 1.3 Signature Algorithms (RFC 8446 Section 4.2.3)
+%%====================================================================
+
+-define(SIG_RSA_PKCS1_SHA256, 16#0401).
+-define(SIG_RSA_PKCS1_SHA384, 16#0501).
+-define(SIG_RSA_PKCS1_SHA512, 16#0601).
+-define(SIG_ECDSA_SECP256R1_SHA256, 16#0403).
+-define(SIG_ECDSA_SECP384R1_SHA384, 16#0503).
+-define(SIG_ECDSA_SECP521R1_SHA512, 16#0603).
+-define(SIG_RSA_PSS_RSAE_SHA256, 16#0804).
+-define(SIG_RSA_PSS_RSAE_SHA384, 16#0805).
+-define(SIG_RSA_PSS_RSAE_SHA512, 16#0806).
+-define(SIG_ED25519, 16#0807).
+-define(SIG_ED448, 16#0808).
+
+%%====================================================================
+%% TLS 1.3 Cipher Suites (RFC 8446 Section B.4)
+%%====================================================================
+
+-define(TLS_AES_128_GCM_SHA256, 16#1301).
+-define(TLS_AES_256_GCM_SHA384, 16#1302).
+-define(TLS_CHACHA20_POLY1305_SHA256, 16#1303).
+
+%%====================================================================
+%% TLS Versions
+%%====================================================================
+
+-define(TLS_VERSION_1_2, 16#0303).
+-define(TLS_VERSION_1_3, 16#0304).
+
+%%====================================================================
 %% Default Values
 %%====================================================================
 

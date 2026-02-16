@@ -183,7 +183,8 @@ header_protection_roundtrip_long_test() ->
 
     %% Long header: first byte has 0x80 bit set
     %% Format: flags (1) + version (4) + DCID len (1) + DCID (8) + SCID len (1) + SCID (8) + ...
-    FirstByte = 16#c0,  % Long header, Initial packet
+    %% PN length is encoded in bits 0-1: 0b11 = 3, so PNLen = 3 + 1 = 4
+    FirstByte = 16#c3,  % Long header, Initial packet, PN len = 4 (bits 0-1 = 3)
     Header = <<FirstByte,
                16#00, 16#00, 16#00, 16#01,  % Version
                16#08,  % DCID length
@@ -192,21 +193,27 @@ header_protection_roundtrip_long_test() ->
                8,7,6,5,4,3,2,1,  % SCID
                16#00,  % Token length (varint)
                16#41, 16#23,  % Length (varint)
-               16#00, 16#00, 16#00, 16#01>>,  % Packet number (4 bytes, encoded in first byte)
+               16#00, 16#00, 16#00, 16#01>>,  % Packet number (4 bytes)
 
     %% Need encrypted payload for sample (at least 20 bytes)
     EncryptedPayload = crypto:strong_rand_bytes(32),
 
     %% PN offset is position of PN in header
     PNOffset = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 2,  % = 26
+    PNLen = (FirstByte band 16#03) + 1,  % = 4
 
     Protected = quic_aead:protect_header(HP, Header, EncryptedPayload, PNOffset),
 
     %% Protected should be same length as original
     ?assertEqual(byte_size(Header), byte_size(Protected)),
 
+    %% For unprotect_header, we need to split: header without PN, and PN + ciphertext
+    <<ProtectedHeaderWithoutPN:PNOffset/binary, ProtectedPN:PNLen/binary>> = Protected,
+    EncryptedPayloadWithPN = <<ProtectedPN/binary, EncryptedPayload/binary>>,
+
     %% Unprotect should recover original
-    {Unprotected, _PNLen} = quic_aead:unprotect_header(HP, Protected, EncryptedPayload, PNOffset),
+    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset),
+    ?assertEqual(PNLen, UnprotPNLen),
     ?assertEqual(Header, Unprotected).
 
 header_protection_roundtrip_short_test() ->
@@ -215,16 +222,23 @@ header_protection_roundtrip_short_test() ->
 
     %% Short header: first byte has 0x80 bit clear
     %% Format: flags (1) + DCID (8) + PN (1-4)
-    FirstByte = 16#40,  % Short header, 1-RTT, spin bit clear, PN len = 1
+    FirstByte = 16#40,  % Short header, 1-RTT, spin bit clear, PN len = 1 (bits 0-1 = 0)
     Header = <<FirstByte,
                1,2,3,4,5,6,7,8,  % DCID (8 bytes)
                16#42>>,  % PN (1 byte)
 
     EncryptedPayload = crypto:strong_rand_bytes(32),
     PNOffset = 9,  % 1 + 8
+    PNLen = (FirstByte band 16#03) + 1,  % = 1
 
     Protected = quic_aead:protect_header(HP, Header, EncryptedPayload, PNOffset),
-    {Unprotected, _PNLen} = quic_aead:unprotect_header(HP, Protected, EncryptedPayload, PNOffset),
+
+    %% For unprotect_header, split header without PN, and PN + ciphertext
+    <<ProtectedHeaderWithoutPN:PNOffset/binary, ProtectedPN:PNLen/binary>> = Protected,
+    EncryptedPayloadWithPN = <<ProtectedPN/binary, EncryptedPayload/binary>>,
+
+    {Unprotected, UnprotPNLen} = quic_aead:unprotect_header(HP, ProtectedHeaderWithoutPN, EncryptedPayloadWithPN, PNOffset),
+    ?assertEqual(PNLen, UnprotPNLen),
     ?assertEqual(Header, Unprotected).
 
 %%====================================================================

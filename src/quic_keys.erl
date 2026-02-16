@@ -89,19 +89,22 @@ derive_initial_server(DCID, Version) ->
 %% Returns {Key, IV, HP} for the given secret.
 -spec derive_keys(binary(), aes_128_gcm | aes_256_gcm | chacha20_poly1305) -> keys().
 derive_keys(Secret, aes_128_gcm) ->
-    Key = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 16),
-    IV = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 16),
+    %% AES-128-GCM uses SHA-256
+    Key = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 16),
+    IV = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
+    HP = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 16),
     {Key, IV, HP};
 derive_keys(Secret, aes_256_gcm) ->
-    Key = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
-    IV = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
+    %% AES-256-GCM uses SHA-384
+    Key = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
+    IV = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
+    HP = quic_hkdf:expand_label(sha384, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
     {Key, IV, HP};
 derive_keys(Secret, chacha20_poly1305) ->
-    Key = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
-    IV = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
-    HP = quic_hkdf:expand_label(Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
+    %% ChaCha20-Poly1305 uses SHA-256
+    Key = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_KEY, <<>>, 32),
+    IV = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_IV, <<>>, 12),
+    HP = quic_hkdf:expand_label(sha256, Secret, ?QUIC_LABEL_QUIC_HP, <<>>, 32),
     {Key, IV, HP}.
 
 %% @doc Derive traffic keys (Key, IV, HP) from a traffic secret.

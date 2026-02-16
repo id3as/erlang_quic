@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY server/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy server code
+COPY server/quic_server.py .
+
+# Expose QUIC port
+EXPOSE 4433/udp
+
+# Run server
+CMD ["python", "quic_server.py", "--host", "0.0.0.0", "--port", "4433", \
+     "--cert", "/certs/cert.pem", "--key", "/certs/priv.key"]

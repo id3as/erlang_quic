@@ -25,3 +25,9 @@ Thumbs.db
 logs/
 log/
 erl_crash.dump
+ct_run.*
+_build/test/logs/
+
+# Generated certificates (keep generate_certs.sh)
+certs/*.pem
+certs/*.key
