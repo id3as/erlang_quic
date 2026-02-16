@@ -177,7 +177,23 @@
     send_queue = [] :: [term()],
 
     %% Close reason
-    close_reason :: term()
+    close_reason :: term(),
+
+    %% Connection Migration (RFC 9000 Section 9)
+    %% Current path (active remote address)
+    current_path :: #path_state{} | undefined,
+    %% Alternative paths being validated
+    alt_paths = [] :: [#path_state{}],
+
+    %% Connection ID Pool (RFC 9000 Section 5.1)
+    %% Our CIDs that we've issued to the peer (via NEW_CONNECTION_ID)
+    local_cid_pool = [] :: [#cid_entry{}],
+    %% Next sequence number for our CIDs
+    local_cid_seq = 1 :: non_neg_integer(),
+    %% Peer's CIDs that we can use (received via NEW_CONNECTION_ID)
+    peer_cid_pool = [] :: [#cid_entry{}],
+    %% Active connection ID limit (from transport params)
+    active_cid_limit = 2 :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -1234,6 +1250,24 @@ process_frame(_Level, {max_streams, bidi, Max}, State) ->
 process_frame(_Level, {max_streams, uni, Max}, State) ->
     State#state{max_streams_uni_remote = Max};
 
+%% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
+process_frame(app, {path_challenge, ChallengeData}, State) ->
+    %% Send PATH_RESPONSE with the same data
+    ResponseFrame = quic_frame:encode({path_response, ChallengeData}),
+    send_app_packet(ResponseFrame, State);
+
+%% PATH_RESPONSE: Response to our PATH_CHALLENGE
+process_frame(app, {path_response, ResponseData}, State) ->
+    handle_path_response(ResponseData, State);
+
+%% NEW_CONNECTION_ID: Peer is providing a new CID for us to use
+process_frame(app, {new_connection_id, SeqNum, RetirePrior, CID, ResetToken}, State) ->
+    handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State);
+
+%% RETIRE_CONNECTION_ID: Peer is retiring one of our CIDs
+process_frame(app, {retire_connection_id, SeqNum}, State) ->
+    handle_retire_connection_id(SeqNum, State);
+
 process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, State) ->
     State#state{close_reason = connection_closed};
 
@@ -2124,3 +2158,220 @@ select_decrypt_keys(ReceivedKeyPhase, #state{key_state = KeyState} = State) ->
 get_current_key_phase(#state{key_state = undefined}) -> 0;
 get_current_key_phase(#state{key_state = KeyState}) ->
     KeyState#key_update_state.current_phase.
+
+%%====================================================================
+%% Connection Migration (RFC 9000 Section 9)
+%%====================================================================
+
+%% @doc Initiate path validation by sending PATH_CHALLENGE.
+%% Returns updated state with the path in validating status.
+-spec initiate_path_validation({inet:ip_address(), inet:port_number()}, #state{}) -> #state{}.
+initiate_path_validation(RemoteAddr, State) ->
+    %% Generate 8-byte random challenge data
+    ChallengeData = crypto:strong_rand_bytes(8),
+
+    %% Create or update path state
+    PathState = #path_state{
+        remote_addr = RemoteAddr,
+        status = validating,
+        challenge_data = ChallengeData,
+        challenge_count = 1,
+        bytes_sent = 0,
+        bytes_received = 0
+    },
+
+    %% Add to alternative paths
+    AltPaths = [PathState | State#state.alt_paths],
+
+    %% Send PATH_CHALLENGE frame
+    ChallengeFrame = quic_frame:encode({path_challenge, ChallengeData}),
+    State1 = State#state{alt_paths = AltPaths},
+
+    %% Note: In a full implementation, we'd send to the specific path
+    %% For now, send on the current path (for testing)
+    send_app_packet(ChallengeFrame, State1).
+
+%% @doc Handle PATH_RESPONSE frame.
+%% Validates the response against pending challenges.
+handle_path_response(ResponseData, State) ->
+    %% Find the path with matching challenge data
+    case find_path_by_challenge(ResponseData, State#state.alt_paths) of
+        {ok, PathState, OtherPaths} ->
+            %% Mark path as validated
+            ValidatedPath = PathState#path_state{
+                status = validated,
+                challenge_data = undefined
+            },
+            State#state{alt_paths = [ValidatedPath | OtherPaths]};
+        not_found ->
+            %% Check current path (if we sent challenge on current path)
+            case State#state.current_path of
+                #path_state{challenge_data = ResponseData} = CurrentPath ->
+                    ValidatedPath = CurrentPath#path_state{
+                        status = validated,
+                        challenge_data = undefined
+                    },
+                    State#state{current_path = ValidatedPath};
+                _ ->
+                    %% Unknown response, ignore
+                    State
+            end
+    end.
+
+%% Find a path by challenge data
+find_path_by_challenge(_Data, []) ->
+    not_found;
+find_path_by_challenge(Data, [#path_state{challenge_data = Data} = Path | Rest]) ->
+    {ok, Path, Rest};
+find_path_by_challenge(Data, [Path | Rest]) ->
+    case find_path_by_challenge(Data, Rest) of
+        {ok, Found, Others} ->
+            {ok, Found, [Path | Others]};
+        not_found ->
+            not_found
+    end.
+
+%% @doc Complete migration to a validated path.
+%% Updates the current path and DCID if necessary.
+-spec complete_migration(#path_state{}, #state{}) -> #state{}.
+complete_migration(#path_state{status = validated} = NewPath, State) ->
+    %% Update remote address
+    State#state{
+        remote_addr = NewPath#path_state.remote_addr,
+        current_path = NewPath,
+        alt_paths = lists:delete(NewPath, State#state.alt_paths)
+    };
+complete_migration(_, State) ->
+    %% Can only migrate to validated paths
+    State.
+
+%% @doc Check if we can send data to a path (anti-amplification).
+%% RFC 9000 Section 8.1: Can only send 3x received bytes on unvalidated path.
+-spec can_send_to_path(#path_state{}, non_neg_integer(), #state{}) -> boolean().
+can_send_to_path(#path_state{status = validated}, _Size, _State) ->
+    true;
+can_send_to_path(#path_state{bytes_sent = Sent, bytes_received = Recv}, Size, _State) ->
+    (Sent + Size) =< (Recv * 3).
+
+%% @doc Handle NEW_CONNECTION_ID frame from peer.
+%% Adds the new CID to our pool of peer CIDs.
+handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
+    #state{peer_cid_pool = Pool, active_cid_limit = Limit} = State,
+
+    %% Retire CIDs with seq < RetirePrior
+    RetiredPool = lists:map(
+        fun(#cid_entry{seq_num = S} = Entry) when S < RetirePrior ->
+                Entry#cid_entry{status = retired};
+           (Entry) ->
+                Entry
+        end, Pool),
+
+    %% Add new CID entry
+    NewEntry = #cid_entry{
+        seq_num = SeqNum,
+        cid = CID,
+        stateless_reset_token = ResetToken,
+        status = active
+    },
+
+    %% Check if already exists
+    case lists:keyfind(SeqNum, #cid_entry.seq_num, RetiredPool) of
+        false ->
+            %% Add new entry, keeping within limit
+            NewPool = [NewEntry | RetiredPool],
+            ActiveCount = length([E || #cid_entry{status = active} = E <- NewPool]),
+            FinalPool = if
+                ActiveCount > Limit ->
+                    %% Remove oldest active CID if over limit
+                    trim_cid_pool(NewPool, Limit);
+                true ->
+                    NewPool
+            end,
+            %% Send RETIRE_CONNECTION_ID for CIDs with seq < RetirePrior
+            State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = FinalPool}),
+            State1;
+        _ ->
+            %% Duplicate, ignore
+            State#state{peer_cid_pool = RetiredPool}
+    end.
+
+%% Trim CID pool to active limit by retiring oldest
+trim_cid_pool(Pool, Limit) ->
+    Active = [E || #cid_entry{status = active} = E <- Pool],
+    Retired = [E || #cid_entry{status = retired} = E <- Pool],
+    Sorted = lists:sort(fun(A, B) -> A#cid_entry.seq_num < B#cid_entry.seq_num end, Active),
+    case length(Sorted) > Limit of
+        true ->
+            {ToRetire, ToKeep} = lists:split(length(Sorted) - Limit, Sorted),
+            NewRetired = [E#cid_entry{status = retired} || E <- ToRetire],
+            NewRetired ++ ToKeep ++ Retired;
+        false ->
+            Pool
+    end.
+
+%% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
+retire_peer_cids(_RetirePrior, State) ->
+    %% In a full implementation, send RETIRE_CONNECTION_ID frames
+    %% For now, just return state
+    State.
+
+%% @doc Handle RETIRE_CONNECTION_ID frame from peer.
+%% Marks the specified CID in our local pool as retired.
+handle_retire_connection_id(SeqNum, State) ->
+    #state{local_cid_pool = Pool} = State,
+    NewPool = lists:map(
+        fun(#cid_entry{seq_num = S} = Entry) when S =:= SeqNum ->
+                Entry#cid_entry{status = retired};
+           (Entry) ->
+                Entry
+        end, Pool),
+    State#state{local_cid_pool = NewPool}.
+
+%% @doc Issue a new connection ID to the peer.
+%% Sends NEW_CONNECTION_ID frame with a new CID.
+issue_new_connection_id(State) ->
+    #state{
+        local_cid_pool = Pool,
+        local_cid_seq = Seq,
+        active_cid_limit = Limit
+    } = State,
+
+    %% Check if we can issue more CIDs
+    ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
+    case ActiveCount < Limit of
+        true ->
+            %% Generate new CID and reset token
+            NewCID = crypto:strong_rand_bytes(8),
+            ResetToken = crypto:strong_rand_bytes(16),
+
+            NewEntry = #cid_entry{
+                seq_num = Seq,
+                cid = NewCID,
+                stateless_reset_token = ResetToken,
+                status = active
+            },
+
+            %% Send NEW_CONNECTION_ID frame
+            Frame = quic_frame:encode({new_connection_id, Seq, 0, NewCID, ResetToken}),
+            State1 = State#state{
+                local_cid_pool = [NewEntry | Pool],
+                local_cid_seq = Seq + 1
+            },
+            send_app_packet(Frame, State1);
+        false ->
+            State
+    end.
+
+%% @doc Get an active peer CID for use.
+%% Returns the CID with the lowest active sequence number.
+get_active_peer_cid(#state{peer_cid_pool = Pool, dcid = CurrentDCID}) ->
+    Active = [E || #cid_entry{status = active} = E <- Pool],
+    case Active of
+        [] ->
+            CurrentDCID;  % Fall back to current DCID
+        _ ->
+            Sorted = lists:sort(fun(A, B) ->
+                A#cid_entry.seq_num < B#cid_entry.seq_num
+            end, Active),
+            (hd(Sorted))#cid_entry.cid
+    end.

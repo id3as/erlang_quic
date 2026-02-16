@@ -272,6 +272,49 @@
     update_state = idle :: idle | initiated | responding
 }).
 
+%% Path State for Connection Migration (RFC 9000 Section 9)
+%% Tracks the validation state and metrics for a network path.
+-record(path_state, {
+    %% Remote address for this path
+    remote_addr :: {inet:ip_address(), inet:port_number()},
+
+    %% Path validation status
+    %% unknown: path not yet validated
+    %% validating: PATH_CHALLENGE sent, waiting for PATH_RESPONSE
+    %% validated: PATH_RESPONSE received successfully
+    %% failed: validation failed (timeout or mismatch)
+    status = unknown :: unknown | validating | validated | failed,
+
+    %% PATH_CHALLENGE data (8 bytes) for validation
+    challenge_data :: binary() | undefined,
+
+    %% Number of PATH_CHALLENGE attempts
+    challenge_count = 0 :: non_neg_integer(),
+
+    %% Anti-amplification: bytes sent/received on this path
+    bytes_sent = 0 :: non_neg_integer(),
+    bytes_received = 0 :: non_neg_integer(),
+
+    %% RTT estimation for this path
+    rtt :: non_neg_integer() | undefined
+}).
+
+%% Connection ID Entry for CID Pool (RFC 9000 Section 5.1)
+%% Manages multiple connection IDs for connection migration.
+-record(cid_entry, {
+    %% Sequence number assigned by the peer
+    seq_num :: non_neg_integer(),
+
+    %% The connection ID
+    cid :: binary(),
+
+    %% Stateless reset token (16 bytes, optional for seq 0)
+    stateless_reset_token :: binary() | undefined,
+
+    %% Status: active (can be used), retired (no longer valid)
+    status = active :: active | retired
+}).
+
 %% Stream state
 -record(stream_state, {
     id :: non_neg_integer(),
