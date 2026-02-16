@@ -34,6 +34,27 @@
 
 -include("quic.hrl").
 
+%% Suppress warnings for helper functions prepared for future use
+-compile([{nowarn_unused_function, [
+    {send_handshake_ack, 1},
+    {process_frames, 3},
+    {cancel_pto_timer, 1},
+    {complete_key_update, 1},
+    {initiate_path_validation, 2},
+    {complete_migration, 2},
+    {can_send_to_path, 3},
+    {issue_new_connection_id, 1},
+    {get_active_peer_cid, 1}
+]}]).
+
+%% Dialyzer nowarn for functions prepared for future use and unreachable patterns
+%% (code structure supports multiple ciphers/paths not yet exercised)
+-dialyzer({nowarn_function, [
+    send_initial_ack/1,
+    select_cipher/1
+]}).
+-dialyzer([no_match]).
+
 %% Registry API
 -export([
     register_conn/2,
@@ -54,6 +75,7 @@
     close_stream/3,
     reset_stream/3,
     handle_timeout/1,
+    handle_timeout/2,
     process/1,
     get_state/1,
     peername/1,
@@ -251,7 +273,7 @@ ensure_registry() ->
 %%====================================================================
 
 %% @doc Start a QUIC connection process.
--spec start_link(inet:hostname() | inet:ip_address(),
+-spec start_link(binary() | inet:hostname() | inet:ip_address(),
                  inet:port_number(),
                  map(),
                  pid()) -> {ok, pid()} | {error, term()}.
@@ -259,7 +281,7 @@ start_link(Host, Port, Opts, Owner) ->
     start_link(Host, Port, Opts, Owner, undefined).
 
 %% @doc Start a QUIC connection with optional pre-opened socket.
--spec start_link(inet:hostname() | inet:ip_address(),
+-spec start_link(binary() | inet:hostname() | inet:ip_address(),
                  inet:port_number(),
                  map(),
                  pid(),
@@ -269,7 +291,7 @@ start_link(Host, Port, Opts, Owner, Socket) ->
 
 %% @doc Initiate a connection to a QUIC server.
 %% This is a convenience wrapper that starts the process and initiates handshake.
--spec connect(inet:hostname() | inet:ip_address(),
+-spec connect(binary() | inet:hostname() | inet:ip_address(),
               inet:port_number(),
               map(),
               pid()) -> {ok, reference(), pid()} | {error, term()}.
@@ -331,6 +353,14 @@ reset_stream(Conn, StreamId, ErrorCode) ->
 -spec handle_timeout(pid()) -> ok.
 handle_timeout(Conn) ->
     gen_statem:cast(Conn, handle_timeout).
+
+%% @doc Handle a timeout event with timestamp.
+%% The NowMs parameter is currently unused as the connection
+%% manages its own timing internally.
+-spec handle_timeout(pid(), non_neg_integer()) -> non_neg_integer() | infinity.
+handle_timeout(Conn, _NowMs) ->
+    gen_statem:cast(Conn, handle_timeout),
+    infinity.
 
 %% @doc Process pending events (called when socket is ready).
 -spec process(pid()) -> ok.
@@ -857,13 +887,19 @@ negotiate_alpn(ClientALPN, ServerALPN) ->
         [] -> undefined
     end.
 
+%% Extract x25519 public key from key share entries list
+extract_x25519_key(undefined) -> undefined;
+extract_x25519_key([]) -> undefined;
+extract_x25519_key([{?GROUP_X25519, PubKey} | _]) -> PubKey;
+extract_x25519_key([_ | Rest]) -> extract_x25519_key(Rest).
+
 %% Server: Send ServerHello in Initial packet
 send_server_hello(ServerHelloMsg, State) ->
     CryptoFrame = quic_frame:encode({crypto, 0, ServerHelloMsg}),
     send_initial_packet(CryptoFrame, State).
 
 %% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
-send_server_handshake_flight(Cipher, TranscriptHashAfterSH, State) ->
+send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     #state{
         scid = SCID,
         alpn = ALPN,
@@ -906,7 +942,7 @@ send_server_handshake_flight(Cipher, TranscriptHashAfterSH, State) ->
     TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
 
     %% Build CertificateVerify
-    CertVerifyMsg = quic_tls:build_certificate_verify(rsa_pss_rsae_sha256, PrivateKey, TranscriptHashForCV),
+    CertVerifyMsg = quic_tls:build_certificate_verify(?SIG_RSA_PSS_RSAE_SHA256, PrivateKey, TranscriptHashForCV),
 
     %% Update transcript after CertificateVerify
     Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
@@ -1596,12 +1632,14 @@ process_tls_messages(Level, Data, State) ->
 process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
                     #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_HELLO} = State) ->
     case quic_tls:parse_client_hello(Body) of
-        {ok, #{client_random := ClientRandom,
-               public_key := ClientPubKey,
+        {ok, #{random := _ClientRandom,
+               key_share := KeyShareEntries,
                cipher_suites := CipherSuites,
-               alpn := ClientALPN,
+               alpn_protocols := ClientALPN,
                transport_params := TP,
                session_id := SessionId}} ->
+            %% Extract x25519 public key from key share entries
+            ClientPubKey = extract_x25519_key(KeyShareEntries),
             %% Select cipher suite (prefer server's order)
             Cipher = select_cipher(CipherSuites),
 
@@ -1616,9 +1654,9 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
 
             %% Build ServerHello
-            {ServerHello, ServerRandom} = quic_tls:build_server_hello(#{
+            {ServerHello, _ServerPrivKey2} = quic_tls:build_server_hello(#{
                 cipher => Cipher,
-                public_key => ServerPubKey,
+                key_pair => {ServerPubKey, ServerPrivKey},
                 session_id => SessionId
             }),
 

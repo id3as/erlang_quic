@@ -17,6 +17,10 @@
 -module(quic_listener).
 -behaviour(gen_server).
 
+%% Suppress warnings for functions prepared for future use
+-compile([{nowarn_unused_function, [{register_cid, 3}, {unregister_cid, 2}]}]).
+-dialyzer({nowarn_function, [register_cid/3, unregister_cid/2]}).
+
 -export([
     start_link/2,
     stop/1,

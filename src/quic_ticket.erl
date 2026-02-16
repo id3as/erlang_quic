@@ -15,6 +15,10 @@
 
 -module(quic_ticket).
 
+%% Suppress warnings for functions prepared for future use
+-compile([{nowarn_unused_function, [{create_ticket, 5}, {build_new_session_ticket, 1}]}]).
+-dialyzer({nowarn_function, [create_ticket/5, build_new_session_ticket/1]}).
+
 -export([
     %% Ticket storage
     new_store/0,

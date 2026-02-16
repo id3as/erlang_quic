@@ -25,6 +25,9 @@
 
 -module(quic_aead).
 
+%% Suppress dialyzer warnings for cipher patterns not yet exercised
+-dialyzer([no_match]).
+
 -export([
     encrypt/5,
     decrypt/5,

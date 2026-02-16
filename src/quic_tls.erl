@@ -598,7 +598,7 @@ build_certificate(Context, Certs) ->
 %% @doc Build CertificateVerify message.
 %% PrivateKey is the server's private key.
 %% TranscriptHash is the hash of all handshake messages up to (not including) CertificateVerify.
--spec build_certificate_verify(atom(), crypto:key_id(), binary()) -> binary().
+-spec build_certificate_verify(non_neg_integer(), crypto:key_id(), binary()) -> binary().
 build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
     %% Build the content to sign
     %% RFC 8446 Section 4.4.3:

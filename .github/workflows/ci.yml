@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp: ['26.0', '27.0']
+        otp: ['26.0', '27.0', '28.0']
 
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +52,8 @@ jobs:
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
         with:
-          otp-version: '27.0'
-          rebar3-version: '3.23.0'
+          otp-version: '28.0'
+          rebar3-version: '3.24.0'
 
       - name: Restore PLT cache
         uses: actions/cache@v4
@@ -61,9 +61,9 @@ jobs:
           path: |
             _build/*_plt
             ~/.cache/rebar3
-          key: ${{ runner.os }}-plt-otp27-${{ hashFiles('rebar.lock') }}
+          key: ${{ runner.os }}-plt-otp28-${{ hashFiles('rebar.lock') }}
           restore-keys: |
-            ${{ runner.os }}-plt-otp27-
+            ${{ runner.os }}-plt-otp28-
 
       - name: Build PLT
         run: rebar3 dialyzer --plt-only
@@ -80,8 +80,8 @@ jobs:
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
         with:
-          otp-version: '27.0'
-          rebar3-version: '3.23.0'
+          otp-version: '28.0'
+          rebar3-version: '3.24.0'
 
       - name: Run XRef
         run: rebar3 xref
