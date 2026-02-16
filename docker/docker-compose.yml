@@ -22,3 +22,19 @@ services:
               "--cert", "/certs/cert.pem", "--key", "/certs/priv.key",
               "--secrets-log", "/logs/sslkeys.log", "-v"]
     restart: unless-stopped
+
+  quic-go-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.quic-go
+    ports:
+      - "4434:4434/udp"
+    volumes:
+      - ../certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "nc", "-u", "-z", "-w1", "localhost", "4434"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
