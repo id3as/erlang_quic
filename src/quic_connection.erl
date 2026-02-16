@@ -884,7 +884,7 @@ decode_long_header_packet(Data, State) ->
             {error, unsupported_packet_type}
     end.
 
-decode_initial_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
+decode_initial_packet(FullPacket, FirstByte, _DCID, ServerSCID, Rest, State) ->
     #state{initial_keys = {_ClientKeys, ServerKeys}} = State,
 
     %% Parse token and length
@@ -896,11 +896,17 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
     <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
 
+    %% Update DCID to server's SCID (this becomes our destination for future packets)
+    State1 = case State#state.dcid =:= State#state.original_dcid of
+        true -> State#state{dcid = ServerSCID};  % First packet from server, update DCID
+        false -> State  % Already updated
+    end,
+
     %% Ensure we have enough data
     case byte_size(Payload) >= PayloadLen of
         true ->
             <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
-            decrypt_packet(initial, Header, FirstByte, EncryptedPayload, RemainingData, ServerKeys, State);
+            decrypt_packet(initial, Header, FirstByte, EncryptedPayload, RemainingData, ServerKeys, State1);
         false ->
             {error, incomplete_packet}
     end.
@@ -1221,8 +1227,9 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg, State) ->
                     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
 
                     %% Send client Finished (cipher-aware)
+                    %% Client Finished uses transcript INCLUDING server Finished (RFC 8446 Section 4.4.4)
                     ClientFinishedKey = quic_crypto:derive_finished_key(Cipher, State#state.client_hs_secret),
-                    ClientVerifyData = quic_crypto:compute_finished_verify(Cipher, ClientFinishedKey, TranscriptHash),
+                    ClientVerifyData = quic_crypto:compute_finished_verify(Cipher, ClientFinishedKey, TranscriptHashFinal),
                     ClientFinishedMsg = quic_tls:build_finished(ClientVerifyData),
                     CryptoFrame = quic_frame:encode({crypto, 0, ClientFinishedMsg}),
 
