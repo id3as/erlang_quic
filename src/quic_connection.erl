@@ -602,6 +602,16 @@ handle_common_event(cast, handle_timeout, _StateName, State) ->
     NewState = check_timeouts(State),
     {keep_state, NewState};
 
+handle_common_event(info, pto_timeout, StateName, State)
+  when StateName =:= connected; StateName =:= handshaking ->
+    %% Handle PTO timeout - send probe packet
+    NewState = handle_pto_timeout(State),
+    {keep_state, NewState};
+
+handle_common_event(info, pto_timeout, _StateName, State) ->
+    %% Ignore PTO in other states
+    {keep_state, State};
+
 handle_common_event(info, {'EXIT', _Pid, _Reason}, _StateName, State) ->
     {keep_state, State};
 
@@ -820,8 +830,12 @@ send_handshake_packet(Payload, State) ->
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{pn_handshake = NewPNSpace}.
 
-%% Send a 1-RTT (application) packet
+%% Send a 1-RTT (application) packet (without tracking frames for retransmission)
 send_app_packet(Payload, State) ->
+    send_app_packet_internal(Payload, [], State).
+
+%% Send a 1-RTT packet with explicit frames list for retransmission tracking
+send_app_packet_internal(Payload, Frames, State) ->
     #state{
         dcid = DCID,
         socket = Socket,
@@ -862,7 +876,7 @@ send_app_packet(Payload, State) ->
     %% Track sent packet for loss detection and congestion control
     %% Determine if ack-eliciting (not ACK-only or padding-only)
     AckEliciting = is_ack_eliciting_payload(Payload),
-    NewLossState = quic_loss:on_packet_sent(LossState, PN, PacketSize, AckEliciting),
+    NewLossState = quic_loss:on_packet_sent(LossState, PN, PacketSize, AckEliciting, Frames),
     NewCCState = case AckEliciting of
         true -> quic_cc:on_packet_sent(CCState, PacketSize);
         false -> CCState
@@ -870,11 +884,14 @@ send_app_packet(Payload, State) ->
 
     %% Update PN space
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State#state{
+    State1 = State#state{
         pn_app = NewPNSpace,
         cc_state = NewCCState,
         loss_state = NewLossState
-    }.
+    },
+
+    %% Set PTO timer for retransmission
+    set_pto_timer(State1).
 
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
@@ -1100,8 +1117,15 @@ process_frame(_Level, {ack, Ranges, AckDelay, _ECN}, State) ->
                 loss_state = NewLossState,
                 cc_state = CCState3
             },
+
+            %% Retransmit lost packets
+            State2 = retransmit_lost_packets(LostPackets, State1),
+
+            %% Reset PTO timer after ACK processing
+            State3 = set_pto_timer(State2),
+
             %% Try to send queued data now that cwnd may have freed up
-            process_send_queue(State1)
+            process_send_queue(State3)
     end;
 
 process_frame(_Level, handshake_done, State) ->
@@ -1597,8 +1621,9 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(D
 
     case quic_cc:can_send(CCState, PacketSize) of
         true ->
-            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Data, Fin}),
-            send_app_packet(StreamFrame, State);
+            Frame = {stream, StreamId, Offset, Data, Fin},
+            Payload = quic_frame:encode(Frame),
+            send_app_packet_internal(Payload, [Frame], State);
         false ->
             %% Queue the data for later sending when cwnd allows
             queue_stream_data(StreamId, Offset, Data, Fin, State)
@@ -1611,8 +1636,9 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
     case quic_cc:can_send(CCState, PacketSize) of
         true ->
             <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
-            StreamFrame = quic_frame:encode({stream, StreamId, Offset, Chunk, false}),
-            State1 = send_app_packet(StreamFrame, State),
+            Frame = {stream, StreamId, Offset, Chunk, false},
+            Payload = quic_frame:encode(Frame),
+            State1 = send_app_packet_internal(Payload, [Frame], State),
             NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
             send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
         false ->
@@ -1684,6 +1710,104 @@ check_timeouts(State) ->
         true ->
             State
     end.
+
+%%====================================================================
+%% Retransmission
+%%====================================================================
+
+%% Retransmit frames from lost packets
+retransmit_lost_packets([], State) ->
+    State;
+retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
+    RetransmitFrames = quic_loss:retransmittable_frames(Frames),
+    State1 = send_retransmit_frames(RetransmitFrames, State),
+    retransmit_lost_packets(Rest, State1).
+
+%% Send frames for retransmission
+send_retransmit_frames([], State) ->
+    State;
+send_retransmit_frames(Frames, State) ->
+    %% Encode all frames and send in a single packet
+    Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
+    send_app_packet_internal(Payload, Frames, State).
+
+%% Handle PTO timeout - send probe packet
+handle_pto_timeout(#state{loss_state = LossState} = State) ->
+    %% Increment PTO count
+    NewLossState = quic_loss:on_pto_expired(LossState),
+    State1 = State#state{loss_state = NewLossState},
+
+    %% Send probe packet (retransmit oldest unacked or send PING)
+    State2 = send_probe_packet(State1),
+
+    %% Set new PTO timer
+    set_pto_timer(State2).
+
+%% Send a probe packet for PTO
+send_probe_packet(State) ->
+    case get_oldest_unacked_frames(State) of
+        {ok, Frames} ->
+            %% Retransmit oldest data as probe
+            send_retransmit_frames(Frames, State);
+        none ->
+            %% No data to retransmit, send PING
+            Payload = quic_frame:encode(ping),
+            send_app_packet_internal(Payload, [ping], State)
+    end.
+
+%% Get frames from the oldest unacked packet for probe retransmission
+get_oldest_unacked_frames(#state{loss_state = LossState}) ->
+    SentPackets = quic_loss:sent_packets(LossState),
+    case maps:size(SentPackets) of
+        0 ->
+            none;
+        _ ->
+            %% Find the oldest packet (lowest PN)
+            {_MinPN, OldestPacket} = maps:fold(
+                fun(PN, Packet, undefined) ->
+                        {PN, Packet};
+                   (PN, Packet, {MinPN, _}) when PN < MinPN ->
+                        {PN, Packet};
+                   (_PN, _Packet, Acc) ->
+                        Acc
+                end,
+                undefined,
+                SentPackets
+            ),
+            #sent_packet{frames = Frames} = OldestPacket,
+            RetransmitFrames = quic_loss:retransmittable_frames(Frames),
+            case RetransmitFrames of
+                [] -> none;
+                _ -> {ok, RetransmitFrames}
+            end
+    end.
+
+%%====================================================================
+%% PTO Timer Management
+%%====================================================================
+
+%% Set PTO timer based on current loss state
+set_pto_timer(#state{loss_state = LossState, pto_timer = OldTimer} = State) ->
+    cancel_timer(OldTimer),
+    case quic_loss:bytes_in_flight(LossState) > 0 of
+        true ->
+            PTO = quic_loss:get_pto(LossState),
+            TimerRef = erlang:send_after(PTO, self(), pto_timeout),
+            State#state{pto_timer = TimerRef};
+        false ->
+            State#state{pto_timer = undefined}
+    end.
+
+%% Cancel PTO timer
+cancel_pto_timer(#state{pto_timer = undefined} = State) ->
+    State;
+cancel_pto_timer(#state{pto_timer = Ref} = State) ->
+    cancel_timer(Ref),
+    State#state{pto_timer = undefined}.
+
+%% Helper to cancel a timer reference
+cancel_timer(undefined) -> ok;
+cancel_timer(Ref) -> erlang:cancel_timer(Ref).
 
 %% Convert state to map for debugging
 state_to_map(#state{} = S) ->

@@ -240,3 +240,105 @@ ack_ecn_test() ->
     {S2, Acked, _Lost} = quic_loss:on_ack_received(S1, AckFrame, Now),
     ?assertEqual(1, length(Acked)),
     ?assertEqual(0, quic_loss:bytes_in_flight(S2)).
+
+%%====================================================================
+%% Frame Storage Tests
+%%====================================================================
+
+on_packet_sent_with_frames_test() ->
+    State = quic_loss:new(),
+    Frames = [{stream, 0, 0, <<"hello">>, false}, ping],
+    S1 = quic_loss:on_packet_sent(State, 0, 100, true, Frames),
+    Sent = quic_loss:sent_packets(S1),
+    ?assert(maps:is_key(0, Sent)),
+    Packet = maps:get(0, Sent),
+    ?assertEqual(Frames, Packet#sent_packet.frames).
+
+on_packet_sent_empty_frames_test() ->
+    State = quic_loss:new(),
+    S1 = quic_loss:on_packet_sent(State, 0, 100, true, []),
+    Sent = quic_loss:sent_packets(S1),
+    Packet = maps:get(0, Sent),
+    ?assertEqual([], Packet#sent_packet.frames).
+
+on_packet_sent_backward_compatible_test() ->
+    %% Test that on_packet_sent/4 still works (calls /5 with empty frames)
+    State = quic_loss:new(),
+    S1 = quic_loss:on_packet_sent(State, 0, 100, true),
+    Sent = quic_loss:sent_packets(S1),
+    Packet = maps:get(0, Sent),
+    ?assertEqual([], Packet#sent_packet.frames).
+
+%%====================================================================
+%% Retransmittable Frames Tests
+%%====================================================================
+
+retransmittable_filters_padding_test() ->
+    Frames = [padding, {padding, 10}, {stream, 0, 0, <<"data">>, false}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([{stream, 0, 0, <<"data">>, false}], Result).
+
+retransmittable_filters_ack_test() ->
+    Frames = [{ack, 5, 0, 5, []}, {stream, 0, 0, <<"data">>, false}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([{stream, 0, 0, <<"data">>, false}], Result).
+
+retransmittable_filters_ack_variants_test() ->
+    Frames = [
+        {ack, 5, 0, 5},  % 4-tuple variant
+        {ack, 5, 0, 5, []},  % 5-tuple variant
+        {ack_ecn, 5, 0, 5, [], 1, 2, 3},  % ECN variant
+        {stream, 0, 0, <<"data">>, false}
+    ],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([{stream, 0, 0, <<"data">>, false}], Result).
+
+retransmittable_filters_connection_close_test() ->
+    Frames = [{connection_close, transport, 0, undefined, <<>>}, ping],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([ping], Result).
+
+retransmittable_keeps_stream_test() ->
+    Frames = [{stream, 0, 100, <<"test data">>, true}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual(Frames, Result).
+
+retransmittable_keeps_crypto_test() ->
+    Frames = [{crypto, 0, <<"handshake data">>}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual(Frames, Result).
+
+retransmittable_keeps_ping_test() ->
+    Frames = [ping],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([ping], Result).
+
+retransmittable_keeps_max_data_test() ->
+    Frames = [{max_data, 1000000}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual(Frames, Result).
+
+retransmittable_empty_list_test() ->
+    ?assertEqual([], quic_loss:retransmittable_frames([])).
+
+retransmittable_all_filtered_test() ->
+    Frames = [padding, {ack, 5, 0, 5, []}],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([], Result).
+
+retransmittable_mixed_test() ->
+    Frames = [
+        padding,
+        {stream, 0, 0, <<"data1">>, false},
+        {ack, 5, 0, 5, []},
+        {crypto, 0, <<"tls data">>},
+        {connection_close, transport, 0, undefined, <<>>},
+        ping
+    ],
+    Result = quic_loss:retransmittable_frames(Frames),
+    Expected = [
+        {stream, 0, 0, <<"data1">>, false},
+        {crypto, 0, <<"tls data">>},
+        ping
+    ],
+    ?assertEqual(Expected, Result).

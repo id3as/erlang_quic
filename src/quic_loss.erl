@@ -35,7 +35,11 @@
 
     %% Packet tracking
     on_packet_sent/4,
+    on_packet_sent/5,
     on_ack_received/3,
+
+    %% Retransmission
+    retransmittable_frames/1,
 
     %% Loss detection
     detect_lost_packets/2,
@@ -113,11 +117,17 @@ new(Opts) ->
 %% Packet Tracking
 %%====================================================================
 
-%% @doc Record that a packet was sent.
+%% @doc Record that a packet was sent (without frames).
 -spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean()) ->
     loss_state().
+on_packet_sent(State, PacketNumber, Size, AckEliciting) ->
+    on_packet_sent(State, PacketNumber, Size, AckEliciting, []).
+
+%% @doc Record that a packet was sent with frames.
+-spec on_packet_sent(loss_state(), non_neg_integer(), non_neg_integer(), boolean(), [term()]) ->
+    loss_state().
 on_packet_sent(#loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = State,
-               PacketNumber, Size, AckEliciting) ->
+               PacketNumber, Size, AckEliciting, Frames) ->
     Now = erlang:monotonic_time(millisecond),
     SentPacket = #sent_packet{
         pn = PacketNumber,
@@ -125,7 +135,7 @@ on_packet_sent(#loss_state{sent_packets = Sent, bytes_in_flight = InFlight} = St
         ack_eliciting = AckEliciting,
         in_flight = true,
         size = Size,
-        frames = []
+        frames = Frames
     },
     NewInFlight = case AckEliciting of
         true -> InFlight + Size;
@@ -379,3 +389,22 @@ ack_delay_to_ms(AckDelay, #loss_state{}) ->
     %% AckDelay is in microseconds after shifting by ack_delay_exponent
     %% Using default exponent of 3
     (AckDelay bsl ?DEFAULT_ACK_DELAY_EXPONENT) div 1000.
+
+%%====================================================================
+%% Retransmission Helpers
+%%====================================================================
+
+%% @doc Filter frames to get only retransmittable ones.
+%% Per RFC 9002, PADDING, ACK, and CONNECTION_CLOSE frames are not retransmitted.
+-spec retransmittable_frames([term()]) -> [term()].
+retransmittable_frames(Frames) ->
+    lists:filter(fun is_retransmittable/1, Frames).
+
+%% Check if a frame is retransmittable
+is_retransmittable(padding) -> false;
+is_retransmittable({padding, _}) -> false;
+is_retransmittable({ack, _, _, _}) -> false;
+is_retransmittable({ack, _, _, _, _}) -> false;
+is_retransmittable({ack_ecn, _, _, _, _, _, _, _}) -> false;
+is_retransmittable({connection_close, _, _, _, _}) -> false;
+is_retransmittable(_) -> true.
