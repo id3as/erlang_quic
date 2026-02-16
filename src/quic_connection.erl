@@ -60,7 +60,9 @@
     sockname/1,
     setopts/2,
     %% Key update (RFC 9001 Section 6)
-    key_update/1
+    key_update/1,
+    %% Server mode
+    start_server/1
 ]).
 
 %% gen_statem callbacks
@@ -83,13 +85,17 @@
 %% Registry table name
 -define(REGISTRY, quic_connection_registry).
 
-%% TLS handshake states
+%% TLS handshake states (client)
 -define(TLS_AWAITING_SERVER_HELLO, awaiting_server_hello).
 -define(TLS_AWAITING_ENCRYPTED_EXT, awaiting_encrypted_extensions).
 -define(TLS_AWAITING_CERT, awaiting_certificate).
 -define(TLS_AWAITING_CERT_VERIFY, awaiting_certificate_verify).
 -define(TLS_AWAITING_FINISHED, awaiting_finished).
 -define(TLS_HANDSHAKE_COMPLETE, handshake_complete).
+
+%% TLS handshake states (server)
+-define(TLS_AWAITING_CLIENT_HELLO, awaiting_client_hello).
+-define(TLS_AWAITING_CLIENT_FINISHED, awaiting_client_finished).
 
 %% Connection state record
 -record(state, {
@@ -193,7 +199,13 @@
     %% Peer's CIDs that we can use (received via NEW_CONNECTION_ID)
     peer_cid_pool = [] :: [#cid_entry{}],
     %% Active connection ID limit (from transport params)
-    active_cid_limit = 2 :: non_neg_integer()
+    active_cid_limit = 2 :: non_neg_integer(),
+
+    %% Server-specific fields
+    listener :: pid() | undefined,
+    server_cert :: binary() | undefined,
+    server_cert_chain = [] :: [binary()],
+    server_private_key :: term() | undefined
 }).
 
 %%====================================================================
@@ -269,6 +281,12 @@ connect(Host, Port, Opts, Owner) ->
         Error ->
             Error
     end.
+
+%% @doc Start a server-side QUIC connection.
+%% Called by quic_listener when a new connection is accepted.
+-spec start_server(map()) -> {ok, pid()} | {error, term()}.
+start_server(Opts) ->
+    gen_statem:start_link(?MODULE, {server, Opts}, []).
 
 %% @doc Send data on a stream.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
@@ -441,6 +459,82 @@ init([Host, Port, Opts, Owner, Socket]) ->
         loss_state = LossState
     },
 
+    {ok, idle, State};
+
+%% Server-side initialization
+init({server, Opts}) ->
+    process_flag(trap_exit, true),
+
+    %% Extract required options
+    Socket = maps:get(socket, Opts),
+    RemoteAddr = maps:get(remote_addr, Opts),
+    InitialDCID = maps:get(initial_dcid, Opts),
+    SCID = maps:get(scid, Opts),
+    Cert = maps:get(cert, Opts),
+    CertChain = maps:get(cert_chain, Opts, []),
+    PrivateKey = maps:get(private_key, Opts),
+    ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
+    Listener = maps:get(listener, Opts),
+
+    %% Generate initial keys using client's DCID (which is our SCID initially)
+    InitialKeys = derive_initial_keys(InitialDCID),
+
+    %% Initialize packet number spaces
+    PNSpace = #pn_space{
+        next_pn = 0,
+        largest_acked = undefined,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0,
+        loss_time = undefined,
+        sent_packets = #{}
+    },
+
+    %% Create connection reference and register
+    ConnRef = make_ref(),
+    register_conn(ConnRef, self()),
+
+    %% Initialize congestion control and loss detection
+    CCState = quic_cc:new(),
+    LossState = quic_loss:new(),
+
+    %% Initialize state
+    State = #state{
+        scid = SCID,
+        dcid = <<>>,  % Will be set from ClientHello SCID
+        original_dcid = InitialDCID,
+        role = server,
+        socket = Socket,
+        remote_addr = RemoteAddr,
+        local_addr = undefined,
+        owner = Listener,  % Listener is the owner for now
+        conn_ref = ConnRef,
+        verify = false,
+        initial_keys = InitialKeys,
+        tls_state = ?TLS_AWAITING_CLIENT_HELLO,
+        alpn_list = normalize_alpn_list(ALPNList),
+        pn_initial = PNSpace,
+        pn_handshake = PNSpace,
+        pn_app = PNSpace,
+        max_data_local = maps:get(max_data, Opts, ?DEFAULT_INITIAL_MAX_DATA),
+        max_data_remote = ?DEFAULT_INITIAL_MAX_DATA,
+        next_stream_id_bidi = 1,  % Server-initiated bidi: 1, 5, 9, ...
+        next_stream_id_uni = 3,   % Server-initiated uni: 3, 7, 11, ...
+        max_streams_bidi_local = maps:get(max_streams_bidi, Opts, ?DEFAULT_MAX_STREAMS_BIDI),
+        max_streams_bidi_remote = ?DEFAULT_MAX_STREAMS_BIDI,
+        max_streams_uni_local = maps:get(max_streams_uni, Opts, ?DEFAULT_MAX_STREAMS_UNI),
+        max_streams_uni_remote = ?DEFAULT_MAX_STREAMS_UNI,
+        idle_timeout = maps:get(idle_timeout, Opts, ?DEFAULT_MAX_IDLE_TIMEOUT),
+        last_activity = erlang:monotonic_time(millisecond),
+        cc_state = CCState,
+        loss_state = LossState,
+        listener = Listener,
+        server_cert = Cert,
+        server_cert_chain = CertChain,
+        server_private_key = PrivateKey
+    },
+
     {ok, idle, State}.
 
 terminate(_Reason, _StateName, #state{socket = Socket, conn_ref = ConnRef}) ->
@@ -460,10 +554,14 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 
 %% ----- IDLE STATE -----
 
-idle(enter, _OldState, State) ->
-    %% Start the handshake by sending Initial packet with ClientHello
+idle(enter, _OldState, #state{role = client} = State) ->
+    %% Client: Start the handshake by sending Initial packet with ClientHello
     NewState = send_client_hello(State),
     {keep_state, NewState};
+
+idle(enter, _OldState, #state{role = server} = State) ->
+    %% Server: Wait for Initial packet with ClientHello
+    {keep_state, State};
 
 idle({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
     {keep_state, State, [{reply, From, Ref}]};
@@ -478,6 +576,11 @@ idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
+    NewState = handle_packet(Data, State),
+    check_state_transition(idle, NewState);
+
+%% Server receives packets from listener
+idle(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(idle, NewState);
 
@@ -508,6 +611,11 @@ handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
+    NewState = handle_packet(Data, State),
+    check_state_transition(handshaking, NewState);
+
+%% Server receives packets from listener
+handshaking(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(handshaking, NewState);
 
@@ -599,6 +707,11 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
     end;
 
 connected(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
+    NewState = handle_packet(Data, State),
+    check_state_transition(connected, NewState);
+
+%% Server receives packets from listener
+connected(info, {quic_packet, Data, _RemoteAddr}, #state{role = server} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(connected, NewState);
 
@@ -724,6 +837,132 @@ send_client_hello(State) ->
     inet:setopts(NewState#state.socket, [{active, once}]),
 
     NewState.
+
+%% Server: Select cipher suite from client's list (server preference)
+select_cipher(ClientCipherSuites) ->
+    ServerPreference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
+    select_first_match(ServerPreference, ClientCipherSuites).
+
+select_first_match([], _) -> aes_128_gcm;  % Default
+select_first_match([Cipher | Rest], ClientSuites) ->
+    case lists:member(Cipher, ClientSuites) of
+        true -> Cipher;
+        false -> select_first_match(Rest, ClientSuites)
+    end.
+
+%% Server: Negotiate ALPN
+negotiate_alpn(ClientALPN, ServerALPN) ->
+    case [A || A <- ServerALPN, lists:member(A, ClientALPN)] of
+        [First | _] -> First;
+        [] -> undefined
+    end.
+
+%% Server: Send ServerHello in Initial packet
+send_server_hello(ServerHelloMsg, State) ->
+    CryptoFrame = quic_frame:encode({crypto, 0, ServerHelloMsg}),
+    send_initial_packet(CryptoFrame, State).
+
+%% Server: Send EncryptedExtensions, Certificate, CertificateVerify, Finished
+send_server_handshake_flight(Cipher, TranscriptHashAfterSH, State) ->
+    #state{
+        scid = SCID,
+        alpn = ALPN,
+        max_data_local = MaxData,
+        max_streams_bidi_local = MaxStreamsBidi,
+        max_streams_uni_local = MaxStreamsUni,
+        server_cert = Cert,
+        server_cert_chain = CertChain,
+        server_private_key = PrivateKey,
+        tls_transcript = Transcript,
+        server_hs_secret = ServerHsSecret,
+        handshake_secret = HandshakeSecret
+    } = State,
+
+    %% Build transport parameters
+    TransportParams = #{
+        initial_scid => SCID,
+        initial_max_data => MaxData,
+        initial_max_stream_data_bidi_local => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_bidi_remote => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_stream_data_uni => ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+        initial_max_streams_bidi => MaxStreamsBidi,
+        initial_max_streams_uni => MaxStreamsUni,
+        max_idle_timeout => State#state.idle_timeout,
+        active_connection_id_limit => 2
+    },
+
+    %% Build EncryptedExtensions
+    EncExtMsg = quic_tls:build_encrypted_extensions(#{
+        alpn => ALPN,
+        transport_params => TransportParams
+    }),
+
+    %% Build Certificate
+    AllCerts = [Cert | CertChain],
+    CertMsg = quic_tls:build_certificate(<<>>, AllCerts),
+
+    %% Update transcript after EncryptedExtensions and Certificate
+    Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertMsg/binary>>,
+    TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
+
+    %% Build CertificateVerify
+    CertVerifyMsg = quic_tls:build_certificate_verify(rsa_pss_rsae_sha256, PrivateKey, TranscriptHashForCV),
+
+    %% Update transcript after CertificateVerify
+    Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
+    TranscriptHashForFinished = quic_crypto:transcript_hash(Cipher, Transcript2),
+
+    %% Build server Finished
+    ServerFinishedKey = quic_crypto:derive_finished_key(Cipher, ServerHsSecret),
+    ServerVerifyData = quic_crypto:compute_finished_verify(Cipher, ServerFinishedKey, TranscriptHashForFinished),
+    FinishedMsg = quic_tls:build_finished(ServerVerifyData),
+
+    %% Update transcript after server Finished
+    Transcript3 = <<Transcript2/binary, FinishedMsg/binary>>,
+    TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript3),
+
+    %% Derive master secret and application keys
+    MasterSecret = quic_crypto:derive_master_secret(Cipher, HandshakeSecret),
+    ClientAppSecret = quic_crypto:derive_client_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
+    ServerAppSecret = quic_crypto:derive_server_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
+
+    %% Derive app keys
+    {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
+    {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
+
+    ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
+    ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
+
+    %% Initialize key update state
+    KeyState = #key_update_state{
+        current_phase = 0,
+        current_keys = {ClientAppKeys, ServerAppKeys},
+        prev_keys = undefined,
+        client_app_secret = ClientAppSecret,
+        server_app_secret = ServerAppSecret,
+        update_state = idle
+    },
+
+    %% Combine all messages into CRYPTO frame payload
+    HandshakePayload = <<EncExtMsg/binary, CertMsg/binary, CertVerifyMsg/binary, FinishedMsg/binary>>,
+    CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
+
+    %% Update state with transcript and app keys
+    State1 = State#state{
+        tls_transcript = Transcript3,
+        master_secret = MasterSecret,
+        app_keys = {ClientAppKeys, ServerAppKeys},
+        key_state = KeyState
+    },
+
+    %% Send in Handshake packet
+    send_handshake_packet(CryptoFrame, State1).
+
+%% Server: Send HANDSHAKE_DONE frame after receiving client Finished
+send_handshake_done(State) ->
+    %% HANDSHAKE_DONE is frame type 0x1e with no payload
+    Frame = quic_frame:encode(handshake_done),
+    send_app_packet(Frame, State).
 
 %% Send an Initial packet
 send_initial_packet(Payload, State) ->
@@ -1352,6 +1591,88 @@ process_tls_messages(Level, Data, State) ->
 
 %% Process individual TLS messages
 %% OriginalMsg contains the exact bytes from the wire for transcript computation
+
+%% Server receives ClientHello
+process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
+                    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_HELLO} = State) ->
+    case quic_tls:parse_client_hello(Body) of
+        {ok, #{client_random := ClientRandom,
+               public_key := ClientPubKey,
+               cipher_suites := CipherSuites,
+               alpn := ClientALPN,
+               transport_params := TP,
+               session_id := SessionId}} ->
+            %% Select cipher suite (prefer server's order)
+            Cipher = select_cipher(CipherSuites),
+
+            %% Generate server key pair
+            {ServerPubKey, ServerPrivKey} = quic_crypto:generate_key_pair(x25519),
+
+            %% Compute shared secret
+            SharedSecret = quic_crypto:compute_shared_secret(
+                x25519, ServerPrivKey, ClientPubKey),
+
+            %% Negotiate ALPN
+            ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
+
+            %% Build ServerHello
+            {ServerHello, ServerRandom} = quic_tls:build_server_hello(#{
+                cipher => Cipher,
+                public_key => ServerPubKey,
+                session_id => SessionId
+            }),
+
+            %% Update transcript with ClientHello
+            Transcript0 = <<OriginalMsg/binary>>,
+            %% Add ServerHello to transcript
+            Transcript = <<Transcript0/binary, ServerHello/binary>>,
+            TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
+
+            %% Derive handshake secrets
+            HashLen = case Cipher of
+                aes_256_gcm -> 48;
+                _ -> 32
+            end,
+            EarlySecret = quic_crypto:derive_early_secret(Cipher, <<0:HashLen/unit:8>>),
+            HandshakeSecret = quic_crypto:derive_handshake_secret(Cipher, EarlySecret, SharedSecret),
+
+            ClientHsSecret = quic_crypto:derive_client_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
+            ServerHsSecret = quic_crypto:derive_server_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
+
+            %% Derive handshake keys
+            {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
+            {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerHsSecret, Cipher),
+
+            ClientHsKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
+            ServerHsKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
+
+            %% Update DCID from ClientHello SCID
+            ClientSCID = maps:get(scid, TP, <<>>),
+
+            State1 = State#state{
+                dcid = ClientSCID,
+                tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
+                tls_transcript = Transcript,
+                tls_private_key = ServerPrivKey,
+                handshake_secret = HandshakeSecret,
+                client_hs_secret = ClientHsSecret,
+                server_hs_secret = ServerHsSecret,
+                handshake_keys = {ClientHsKeys, ServerHsKeys},
+                alpn = ALPN,
+                transport_params = TP
+            },
+
+            %% Send ServerHello in Initial packet
+            State2 = send_server_hello(ServerHello, State1),
+
+            %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished in Handshake packet
+            send_server_handshake_flight(Cipher, TranscriptHash, State2);
+
+        {error, _} ->
+            State
+    end;
+
+%% Client receives ServerHello
 process_tls_message(_Level, ?TLS_SERVER_HELLO, Body, OriginalMsg, State) ->
     case quic_tls:parse_server_hello(Body) of
         {ok, #{public_key := ServerPubKey, cipher := Cipher}} ->
@@ -1431,7 +1752,9 @@ process_tls_message(_Level, ?TLS_CERTIFICATE_VERIFY, _Body, OriginalMsg, State) 
         tls_transcript = Transcript
     };
 
-process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg, State) ->
+%% Client receives server's Finished
+process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
+                    #state{role = client, tls_state = ?TLS_AWAITING_FINISHED} = State) ->
     %% Get cipher from handshake keys for cipher-aware operations
     {ClientHsKeys, _} = State#state.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
@@ -1488,6 +1811,38 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg, State) ->
                 false ->
                     %% Verification failed
                     error_logger:info_msg("[QUIC] Server Finished verification failed~n", []),
+                    State
+            end;
+        {error, _} ->
+            State
+    end;
+
+%% Server receives client's Finished
+process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
+                    #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_FINISHED} = State) ->
+    {ClientHsKeys, _} = State#state.handshake_keys,
+    Cipher = ClientHsKeys#crypto_keys.cipher,
+
+    case quic_tls:parse_finished(Body) of
+        {ok, VerifyData} ->
+            %% Verify client's Finished using client handshake secret
+            TranscriptHash = quic_crypto:transcript_hash(Cipher, State#state.tls_transcript),
+            case quic_tls:verify_finished(VerifyData, State#state.client_hs_secret, TranscriptHash, Cipher) of
+                true ->
+                    %% Update transcript with client Finished
+                    Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+
+                    %% Application keys are already derived when server sent its Finished
+                    %% Mark handshake as complete
+                    State1 = State#state{
+                        tls_state = ?TLS_HANDSHAKE_COMPLETE,
+                        tls_transcript = Transcript
+                    },
+
+                    %% Send HANDSHAKE_DONE frame to client
+                    send_handshake_done(State1);
+                false ->
+                    error_logger:info_msg("[QUIC] Client Finished verification failed~n", []),
                     State
             end;
         {error, _} ->

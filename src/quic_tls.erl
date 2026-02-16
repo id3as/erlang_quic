@@ -27,7 +27,7 @@
     %% ClientHello
     build_client_hello/1,
 
-    %% Server message parsing
+    %% Server message parsing (client-side)
     parse_server_hello/1,
     parse_encrypted_extensions/1,
     parse_certificate/1,
@@ -38,6 +38,13 @@
     build_finished/1,
     verify_finished/3,
     verify_finished/4,
+
+    %% Server-side message building
+    parse_client_hello/1,
+    build_server_hello/1,
+    build_encrypted_extensions/1,
+    build_certificate/2,
+    build_certificate_verify/3,
 
     %% Transport parameters
     encode_transport_params/1,
@@ -453,3 +460,252 @@ cipher_from_suite(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
 cipher_from_suite(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
 cipher_from_suite(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
 cipher_from_suite(_) -> aes_128_gcm.
+
+%%====================================================================
+%% Server-side TLS Functions
+%%====================================================================
+
+%% @doc Parse a ClientHello message.
+%% Returns a map with:
+%%   - random: 32-byte client random
+%%   - session_id: Legacy session ID
+%%   - cipher_suites: List of cipher suites offered
+%%   - extensions: Map of extensions
+%%   - key_share: Client's public key for key exchange
+%%   - server_name: SNI hostname (if present)
+%%   - alpn_protocols: List of ALPN protocols (if present)
+%%   - transport_params: QUIC transport parameters (if present)
+-spec parse_client_hello(binary()) ->
+    {ok, map()} | {error, term()}.
+parse_client_hello(<<
+    ?TLS_VERSION_1_2:16,  % Legacy version
+    Random:32/binary,
+    SessionIdLen:8, SessionId:SessionIdLen/binary,
+    CipherSuitesLen:16, CipherSuites:CipherSuitesLen/binary,
+    CompressionLen:8, _Compression:CompressionLen/binary,
+    ExtLen:16, Extensions:ExtLen/binary,
+    _Rest/binary
+>>) ->
+    %% Parse cipher suites
+    Ciphers = parse_cipher_suites(CipherSuites),
+
+    %% Parse extensions
+    case parse_extensions(Extensions) of
+        {ok, ExtMap} ->
+            %% Extract key_share
+            KeyShare = case maps:find(?EXT_KEY_SHARE, ExtMap) of
+                {ok, KsData} -> parse_client_key_shares(KsData);
+                error -> undefined
+            end,
+
+            %% Extract SNI
+            ServerName = case maps:find(?EXT_SERVER_NAME, ExtMap) of
+                {ok, SniData} -> parse_server_name_ext(SniData);
+                error -> undefined
+            end,
+
+            %% Extract ALPN
+            ALPNProtocols = case maps:find(?EXT_ALPN, ExtMap) of
+                {ok, AlpnData} -> parse_alpn_ext(AlpnData);
+                error -> []
+            end,
+
+            %% Extract QUIC transport parameters
+            TransportParams = case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
+                {ok, TpData} -> decode_transport_params(TpData);
+                error -> #{}
+            end,
+
+            {ok, #{
+                random => Random,
+                session_id => SessionId,
+                cipher_suites => Ciphers,
+                extensions => ExtMap,
+                key_share => KeyShare,
+                server_name => ServerName,
+                alpn_protocols => ALPNProtocols,
+                transport_params => TransportParams
+            }};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+parse_client_hello(_) ->
+    {error, invalid_client_hello}.
+
+%% @doc Build a ServerHello message.
+%% Options:
+%%   - random: Server random (32 bytes, generated if not provided)
+%%   - session_id: Legacy session ID to echo
+%%   - cipher_suite: Selected cipher suite
+%%   - key_share: Server's public key
+-spec build_server_hello(map()) -> {binary(), binary()}.
+build_server_hello(Opts) ->
+    %% Generate server random
+    Random = maps:get(random, Opts, crypto:strong_rand_bytes(32)),
+
+    %% Echo session ID from client
+    SessionId = maps:get(session_id, Opts, <<>>),
+    SessionIdLen = byte_size(SessionId),
+
+    %% Selected cipher suite
+    CipherSuite = maps:get(cipher_suite, Opts, ?TLS_AES_128_GCM_SHA256),
+
+    %% Generate ECDHE key pair if not provided
+    {PubKey, PrivKey} = case maps:find(key_pair, Opts) of
+        {ok, {Pub, Priv}} -> {Pub, Priv};
+        error -> crypto:generate_key(ecdh, x25519)
+    end,
+
+    %% Build extensions
+    Extensions = build_server_hello_extensions(PubKey, Opts),
+    ExtLen = byte_size(Extensions),
+
+    %% Build ServerHello
+    ServerHello = <<
+        ?TLS_VERSION_1_2:16,  % Legacy version (TLS 1.2)
+        Random:32/binary,
+        SessionIdLen:8, SessionId/binary,
+        CipherSuite:16,
+        0:8,  % Legacy compression method (null)
+        ExtLen:16, Extensions/binary
+    >>,
+
+    %% Wrap with handshake header
+    Message = encode_handshake_message(?TLS_SERVER_HELLO, ServerHello),
+    {Message, PrivKey}.
+
+%% @doc Build EncryptedExtensions message.
+%% Options:
+%%   - alpn: Selected ALPN protocol
+%%   - transport_params: QUIC transport parameters
+-spec build_encrypted_extensions(map()) -> binary().
+build_encrypted_extensions(Opts) ->
+    Extensions = build_encrypted_extensions_list(Opts),
+    ExtLen = byte_size(Extensions),
+    Body = <<ExtLen:16, Extensions/binary>>,
+    encode_handshake_message(?TLS_ENCRYPTED_EXTENSIONS, Body).
+
+%% @doc Build Certificate message.
+%% Certs is a list of DER-encoded certificates (server cert first).
+-spec build_certificate(binary(), [binary()]) -> binary().
+build_certificate(Context, Certs) ->
+    CertList = build_cert_list(Certs),
+    CertListLen = byte_size(CertList),
+    ContextLen = byte_size(Context),
+    Body = <<ContextLen:8, Context/binary, CertListLen:24, CertList/binary>>,
+    encode_handshake_message(?TLS_CERTIFICATE, Body).
+
+%% @doc Build CertificateVerify message.
+%% PrivateKey is the server's private key.
+%% TranscriptHash is the hash of all handshake messages up to (not including) CertificateVerify.
+-spec build_certificate_verify(atom(), crypto:key_id(), binary()) -> binary().
+build_certificate_verify(SignatureAlgorithm, PrivateKey, TranscriptHash) ->
+    %% Build the content to sign
+    %% RFC 8446 Section 4.4.3:
+    %% Content = 64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + TranscriptHash
+    Spaces = binary:copy(<<32>>, 64),
+    ContextString = <<"TLS 1.3, server CertificateVerify">>,
+    Content = <<Spaces/binary, ContextString/binary, 0, TranscriptHash/binary>>,
+
+    %% Sign with the appropriate algorithm
+    {SigAlg, HashAlg, SignOpts} = get_signature_params(SignatureAlgorithm),
+    Signature = crypto:sign(SigAlg, HashAlg, Content, PrivateKey, SignOpts),
+
+    SigLen = byte_size(Signature),
+    Body = <<SignatureAlgorithm:16, SigLen:16, Signature/binary>>,
+    encode_handshake_message(?TLS_CERTIFICATE_VERIFY, Body).
+
+%%====================================================================
+%% Server-side Internal Functions
+%%====================================================================
+
+parse_cipher_suites(<<>>) ->
+    [];
+parse_cipher_suites(<<Suite:16, Rest/binary>>) ->
+    [Suite | parse_cipher_suites(Rest)].
+
+parse_client_key_shares(<<Len:16, Data:Len/binary, _/binary>>) ->
+    parse_key_share_entries(Data);
+parse_client_key_shares(_) ->
+    undefined.
+
+parse_key_share_entries(<<>>) ->
+    [];
+parse_key_share_entries(<<Group:16, Len:16, KeyData:Len/binary, Rest/binary>>) ->
+    [{Group, KeyData} | parse_key_share_entries(Rest)];
+parse_key_share_entries(_) ->
+    [].
+
+parse_server_name_ext(<<Len:16, Data:Len/binary, _/binary>>) ->
+    parse_server_name_list(Data);
+parse_server_name_ext(_) ->
+    undefined.
+
+parse_server_name_list(<<0:8, NameLen:16, Name:NameLen/binary, _/binary>>) ->
+    Name;  % Type 0 = hostname
+parse_server_name_list(_) ->
+    undefined.
+
+parse_alpn_ext(<<Len:16, Data:Len/binary, _/binary>>) ->
+    parse_alpn_list(Data);
+parse_alpn_ext(_) ->
+    [].
+
+parse_alpn_list(<<>>) ->
+    [];
+parse_alpn_list(<<Len:8, Proto:Len/binary, Rest/binary>>) ->
+    [Proto | parse_alpn_list(Rest)];
+parse_alpn_list(_) ->
+    [].
+
+build_server_hello_extensions(PubKey, _Opts) ->
+    %% Supported versions extension (mandatory for TLS 1.3)
+    SupportedVersions = encode_extension(?EXT_SUPPORTED_VERSIONS, <<?TLS_VERSION_1_3:16>>),
+
+    %% Key share extension
+    KeyShare = encode_extension(?EXT_KEY_SHARE,
+        <<?GROUP_X25519:16, 32:16, PubKey:32/binary>>),
+
+    <<SupportedVersions/binary, KeyShare/binary>>.
+
+build_encrypted_extensions_list(Opts) ->
+    %% ALPN extension (if ALPN was negotiated)
+    ALPNExt = case maps:find(alpn, Opts) of
+        {ok, ALPN} when is_binary(ALPN), byte_size(ALPN) > 0 ->
+            ALPNLen = byte_size(ALPN),
+            encode_extension(?EXT_ALPN, <<(ALPNLen + 1):16, ALPNLen:8, ALPN/binary>>);
+        _ ->
+            <<>>
+    end,
+
+    %% QUIC transport parameters
+    TPExt = case maps:find(transport_params, Opts) of
+        {ok, TP} when map_size(TP) > 0 ->
+            TPData = encode_transport_params(TP),
+            encode_extension(?EXT_QUIC_TRANSPORT_PARAMS, TPData);
+        _ ->
+            <<>>
+    end,
+
+    <<ALPNExt/binary, TPExt/binary>>.
+
+build_cert_list([]) ->
+    <<>>;
+build_cert_list([Cert | Rest]) ->
+    CertLen = byte_size(Cert),
+    RestCerts = build_cert_list(Rest),
+    %% Each cert entry: cert_data<1..2^24-1> extensions<0..2^16-1>
+    <<CertLen:24, Cert/binary, 0:16, RestCerts/binary>>.
+
+get_signature_params(?SIG_RSA_PSS_RSAE_SHA256) ->
+    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+get_signature_params(?SIG_RSA_PSS_RSAE_SHA384) ->
+    {rsa, sha384, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+get_signature_params(?SIG_RSA_PSS_RSAE_SHA512) ->
+    {rsa, sha512, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]};
+get_signature_params(?SIG_ECDSA_SECP256R1_SHA256) ->
+    {ecdsa, sha256, []};
+get_signature_params(?SIG_ECDSA_SECP384R1_SHA384) ->
+    {ecdsa, sha384, []};
+get_signature_params(_) ->
+    {rsa, sha256, [{rsa_padding, rsa_pkcs1_pss_padding}, {rsa_pss_saltlen, -1}]}.
