@@ -74,7 +74,11 @@
 
     %% ECDHE
     generate_key_pair/1,
-    compute_shared_secret/3
+    compute_shared_secret/3,
+
+    %% Retry Packet Integrity (RFC 9001 Section 5.8)
+    verify_retry_integrity_tag/3,
+    compute_retry_integrity_tag/3
 ]).
 
 %% Hash length for SHA-256
@@ -345,6 +349,64 @@ generate_key_pair(Curve) ->
                             binary(), binary()) -> binary().
 compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
     crypto:compute_key(ecdh, TheirPublic, OurPrivate, Curve).
+
+%%====================================================================
+%% Retry Packet Integrity (RFC 9001 Section 5.8)
+%%====================================================================
+
+%% RFC 9001 Section 5.8 - Retry Integrity Key and Nonce for QUIC v1
+-define(RETRY_INTEGRITY_KEY_V1, <<16#be, 16#0c, 16#69, 16#0b, 16#9f, 16#66, 16#57, 16#5a,
+                                  16#1d, 16#76, 16#6b, 16#54, 16#e3, 16#68, 16#c8, 16#4e>>).
+-define(RETRY_INTEGRITY_NONCE_V1, <<16#46, 16#15, 16#99, 16#d3, 16#5d, 16#63, 16#2b, 16#f2,
+                                   16#23, 16#98, 16#25, 16#bb>>).
+
+%% RFC 9001 Section 5.8 - Retry Integrity Key and Nonce for QUIC v2
+-define(RETRY_INTEGRITY_KEY_V2, <<16#8f, 16#b4, 16#b0, 16#1b, 16#56, 16#ac, 16#48, 16#e2,
+                                  16#60, 16#fb, 16#cb, 16#ce, 16#ad, 16#7c, 16#ba, 16#00>>).
+-define(RETRY_INTEGRITY_NONCE_V2, <<16#d8, 16#69, 16#69, 16#50, 16#c9, 16#06, 16#79, 16#a4,
+                                   16#da, 16#88, 16#7e, 16#ce>>).
+
+%% @doc Verify the integrity tag of a Retry packet.
+%% RFC 9001 Section 5.8:
+%% - Retry Pseudo-Packet = <ODCID length> <ODCID> <Retry packet without tag>
+%% - Tag = AES-128-GCM(Key, Nonce, AAD=Pseudo-Packet, "")
+%% Returns true if the tag is valid, false otherwise.
+-spec verify_retry_integrity_tag(binary(), binary(), non_neg_integer()) -> boolean().
+verify_retry_integrity_tag(OriginalDCID, RetryPacket, Version) ->
+    %% The Retry packet includes the 16-byte integrity tag at the end
+    case byte_size(RetryPacket) >= 16 of
+        true ->
+            PacketLen = byte_size(RetryPacket) - 16,
+            <<PacketWithoutTag:PacketLen/binary, IntegrityTag:16/binary>> = RetryPacket,
+            ExpectedTag = compute_retry_integrity_tag(OriginalDCID, PacketWithoutTag, Version),
+            IntegrityTag =:= ExpectedTag;
+        false ->
+            false
+    end.
+
+%% @doc Compute the integrity tag for a Retry packet.
+%% Used by servers to generate tags and by clients to verify.
+-spec compute_retry_integrity_tag(binary(), binary(), non_neg_integer()) -> binary().
+compute_retry_integrity_tag(OriginalDCID, RetryPacketWithoutTag, Version) ->
+    {Key, Nonce} = retry_integrity_secrets(Version),
+    ODCIDLen = byte_size(OriginalDCID),
+    %% Retry Pseudo-Packet per RFC 9001 Section 5.8
+    PseudoPacket = <<ODCIDLen, OriginalDCID/binary, RetryPacketWithoutTag/binary>>,
+    %% AEAD encrypt with empty plaintext (tag only)
+    %% crypto_one_time_aead returns {Ciphertext, Tag} for encryption
+    {<<>>, Tag} = crypto:crypto_one_time_aead(aes_128_gcm, Key, Nonce, <<>>, PseudoPacket, 16, true),
+    Tag.
+
+%% Get the retry integrity key and nonce for a QUIC version
+retry_integrity_secrets(Version) when Version =:= 16#00000001 orelse Version =:= 1 ->
+    %% QUIC v1 (RFC 9000)
+    {?RETRY_INTEGRITY_KEY_V1, ?RETRY_INTEGRITY_NONCE_V1};
+retry_integrity_secrets(Version) when Version =:= 16#6b3343cf ->
+    %% QUIC v2 (RFC 9369)
+    {?RETRY_INTEGRITY_KEY_V2, ?RETRY_INTEGRITY_NONCE_V2};
+retry_integrity_secrets(_Version) ->
+    %% Default to v1 for unknown versions
+    {?RETRY_INTEGRITY_KEY_V1, ?RETRY_INTEGRITY_NONCE_V1}.
 
 %%====================================================================
 %% Internal Functions

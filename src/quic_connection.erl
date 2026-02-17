@@ -123,6 +123,9 @@
     scid :: binary(),
     dcid :: binary(),
     original_dcid :: binary(),
+    %% Retry handling (RFC 9000 Section 8.1)
+    retry_token = <<>> :: binary(),  % Token from Retry packet for Initial resend
+    retry_received = false :: boolean(),  % Whether a Retry packet has been received
     role :: client | server,
     version = ?QUIC_VERSION_1 :: non_neg_integer(),
 
@@ -1020,18 +1023,24 @@ send_initial_packet(Payload, State) ->
         socket = Socket,
         remote_addr = {IP, Port},
         initial_keys = {ClientKeys, _ServerKeys},
-        pn_initial = PNSpace
+        pn_initial = PNSpace,
+        retry_token = RetryToken
     } = State,
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
+
+    %% Encode the retry token (RFC 9000 Section 17.2.2)
+    %% Token is a variable-length field preceded by a varint length
+    TokenLen = byte_size(RetryToken),
+    TokenLenEnc = quic_varint:encode(TokenLen),
 
     %% Build header (without packet number, for AAD)
     HeaderBody = <<
         Version:32,
         (byte_size(DCID)):8, DCID/binary,
         (byte_size(SCID)):8, SCID/binary,
-        0,  % Token length (varint = 0)
+        TokenLenEnc/binary, RetryToken/binary,  % Token length + token
         (quic_varint:encode(byte_size(Payload) + PNLen + 16))/binary  % +16 for AEAD tag
     >>,
 
@@ -1284,7 +1293,7 @@ decode_and_decrypt_packet(Data, State) ->
 %% Decode long header packet (Initial, Handshake, etc.)
 decode_long_header_packet(Data, State) ->
     %% Parse unprotected header to get DCID length
-    <<FirstByte, _Version:32, DCIDLen, Rest/binary>> = Data,
+    <<FirstByte, Version:32, DCIDLen, Rest/binary>> = Data,
     <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
     <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
 
@@ -1295,6 +1304,8 @@ decode_long_header_packet(Data, State) ->
             decode_initial_packet(Data, FirstByte, DCID, SCID, Rest3, State);
         2 -> %% Handshake
             decode_handshake_packet(Data, FirstByte, DCID, SCID, Rest3, State);
+        3 -> %% Retry (RFC 9000 Section 17.2.5)
+            handle_retry_packet(Data, Version, SCID, Rest3, State);
         _ ->
             {error, unsupported_packet_type}
     end.
@@ -1344,6 +1355,83 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
                     {error, incomplete_packet}
             end
     end.
+
+%% Handle Retry packet (RFC 9000 Section 8.1, RFC 9001 Section 5.8)
+%% A client receives a Retry when the server requests address validation.
+handle_retry_packet(_FullPacket, _Version, _ServerSCID, _Rest,
+                    #state{role = server}) ->
+    %% Servers don't receive Retry packets
+    {error, unexpected_retry};
+handle_retry_packet(_FullPacket, _Version, _ServerSCID, _Rest,
+                    #state{retry_received = true}) ->
+    %% RFC 9000 Section 17.2.5.2: MUST discard subsequent Retry packets
+    {error, duplicate_retry};
+handle_retry_packet(FullPacket, Version, ServerSCID, Rest,
+                    #state{role = client, original_dcid = OriginalDCID} = State) ->
+    %% Rest contains: Retry Token + Retry Integrity Tag (16 bytes at end)
+    %% There's no length field, the entire remaining data is the token + tag
+    RetryTokenAndTag = Rest,
+
+    %% Verify the integrity tag (RFC 9001 Section 5.8)
+    case quic_crypto:verify_retry_integrity_tag(OriginalDCID, FullPacket, Version) of
+        true ->
+            %% Extract the retry token (everything except last 16 bytes)
+            TagLen = 16,
+            case byte_size(RetryTokenAndTag) > TagLen of
+                true ->
+                    TokenLen = byte_size(RetryTokenAndTag) - TagLen,
+                    <<RetryToken:TokenLen/binary, _IntegrityTag:TagLen/binary>> = RetryTokenAndTag,
+                    handle_valid_retry(RetryToken, ServerSCID, State);
+                false ->
+                    {error, invalid_retry_token}
+            end;
+        false ->
+            {error, retry_integrity_check_failed}
+    end.
+
+%% Process a valid Retry packet
+handle_valid_retry(RetryToken, ServerSCID, State) ->
+    %% RFC 9000 Section 8.1.2: Client MUST use the new SCID from the Retry
+    %% as the DCID for subsequent packets
+    State1 = State#state{
+        dcid = ServerSCID,
+        retry_token = RetryToken,
+        retry_received = true
+    },
+
+    %% Regenerate initial keys with the NEW DCID (ServerSCID)
+    {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID),
+    State2 = State1#state{initial_keys = {ClientKeys, ServerKeys}},
+
+    %% Reset crypto state for a fresh Initial
+    State3 = State2#state{
+        crypto_offset = #{initial => 0, handshake => 0, app => 0},
+        tls_transcript = <<>>
+    },
+
+    %% Reset packet number space for Initial
+    State4 = reset_initial_pn_space(State3),
+
+    %% Resend the ClientHello using send_client_hello
+    %% (the retry_token field is now set, so send_initial_packet will use it)
+    State5 = send_client_hello(State4),
+
+    %% Return state with retry info, no frames to process
+    {ok, retry_handled, [], <<>>, State5}.
+
+%% Reset the initial packet number space after a Retry
+reset_initial_pn_space(State) ->
+    PNSpace = #pn_space{
+        next_pn = 0,
+        largest_acked = undefined,
+        largest_recv = undefined,
+        recv_time = undefined,
+        ack_ranges = [],
+        ack_eliciting_in_flight = 0,
+        loss_time = undefined,
+        sent_packets = #{}
+    },
+    State#state{pn_initial = PNSpace}.
 
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
