@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3] - 2026-02-17
+
+### Fixed
+- Fixed transport params parsing in ClientHello - properly unwrap {ok, Map} result
+
 ## [0.6.2] - 2026-02-17
 
 ### Fixed

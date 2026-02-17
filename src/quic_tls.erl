@@ -516,7 +516,11 @@ parse_client_hello(<<
 
             %% Extract QUIC transport parameters
             TransportParams = case maps:find(?EXT_QUIC_TRANSPORT_PARAMS, ExtMap) of
-                {ok, TpData} -> decode_transport_params(TpData);
+                {ok, TpData} ->
+                    case decode_transport_params(TpData) of
+                        {ok, TP} -> TP;
+                        {error, _} -> #{}
+                    end;
                 error -> #{}
             end,
 
