@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-02-17
+
+### Fixed
+- Server-side packet decryption now uses correct keys (client keys for Initial/Handshake packets received from clients)
+
 ## [0.6.0] - 2026-02-17
 
 ### Added

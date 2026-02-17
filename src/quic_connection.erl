@@ -1386,7 +1386,15 @@ decode_long_header_packet(Data, State) ->
     end.
 
 decode_initial_packet(FullPacket, FirstByte, _DCID, ServerSCID, Rest, State) ->
-    #state{initial_keys = {_ClientKeys, ServerKeys}} = State,
+    #state{initial_keys = {ClientKeys, ServerKeys}, role = Role} = State,
+
+    %% Select correct keys based on role:
+    %% - Client receives from server -> use ServerKeys
+    %% - Server receives from client -> use ClientKeys
+    DecryptKeys = case Role of
+        client -> ServerKeys;
+        server -> ClientKeys
+    end,
 
     %% Parse token and length
     {TokenLen, Rest2} = quic_varint:decode(Rest),
@@ -1407,7 +1415,7 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, ServerSCID, Rest, State) ->
     case byte_size(Payload) >= PayloadLen of
         true ->
             <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
-            decrypt_packet(initial, Header, FirstByte, EncryptedPayload, RemainingData, ServerKeys, State1);
+            decrypt_packet(initial, Header, FirstByte, EncryptedPayload, RemainingData, DecryptKeys, State1);
         false ->
             {error, incomplete_packet}
     end.
@@ -1416,7 +1424,12 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
     case State#state.handshake_keys of
         undefined ->
             {error, no_handshake_keys};
-        {_ClientKeys, ServerKeys} ->
+        {ClientKeys, ServerKeys} ->
+            %% Select correct keys based on role
+            DecryptKeys = case State#state.role of
+                client -> ServerKeys;
+                server -> ClientKeys
+            end,
             %% Parse length
             {PayloadLen, Rest2} = quic_varint:decode(Rest),
             HeaderLen = byte_size(FullPacket) - byte_size(Rest2),
@@ -1425,7 +1438,7 @@ decode_handshake_packet(FullPacket, FirstByte, _DCID, _SCID, Rest, State) ->
             case byte_size(Payload) >= PayloadLen of
                 true ->
                     <<EncryptedPayload:PayloadLen/binary, RemainingData/binary>> = Payload,
-                    decrypt_packet(handshake, Header, FirstByte, EncryptedPayload, RemainingData, ServerKeys, State);
+                    decrypt_packet(handshake, Header, FirstByte, EncryptedPayload, RemainingData, DecryptKeys, State);
                 false ->
                     {error, incomplete_packet}
             end
