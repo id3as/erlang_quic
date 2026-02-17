@@ -167,6 +167,8 @@ handle_cast(_Msg, State) ->
 %% Handle incoming UDP packets
 handle_info({udp, Socket, SrcIP, SrcPort, Packet},
             #listener_state{socket = Socket} = State) ->
+    error_logger:info_msg("Listener received UDP packet from ~p:~p, size=~p~n",
+                          [SrcIP, SrcPort, byte_size(Packet)]),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
 
@@ -198,12 +200,16 @@ code_change(_OldVsn, State, _Extra) ->
 handle_packet(Packet, RemoteAddr, State) ->
     case parse_packet_header(Packet) of
         {initial, DCID, _SCID, _Rest} ->
+            error_logger:info_msg("Listener: Initial packet, DCID=~p~n", [DCID]),
             handle_initial_packet(Packet, DCID, RemoteAddr, State);
         {short, DCID, _Rest} ->
+            error_logger:info_msg("Listener: Short header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, _PacketType, _Rest} ->
+            error_logger:info_msg("Listener: Long header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
-        {error, _Reason} ->
+        {error, Reason} ->
+            error_logger:info_msg("Listener: Error parsing packet: ~p~n", [Reason]),
             %% Drop malformed packets
             ok
     end.
