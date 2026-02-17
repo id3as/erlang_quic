@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-02-17
+
+### Fixed
+- Pad payload for header protection sampling to prevent crashes during PTO timeout
+
 ## [0.5.0] - 2026-02-17
 
 ### Added
