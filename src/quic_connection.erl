@@ -1037,13 +1037,16 @@ send_initial_packet(Payload, State) ->
     TokenLen = byte_size(RetryToken),
     TokenLenEnc = quic_varint:encode(TokenLen),
 
+    %% Pad payload if needed for header protection sampling
+    PaddedPayload = pad_for_header_protection(Payload),
+
     %% Build header (without packet number, for AAD)
     HeaderBody = <<
         Version:32,
         (byte_size(DCID)):8, DCID/binary,
         (byte_size(SCID)):8, SCID/binary,
         TokenLenEnc/binary, RetryToken/binary,  % Token length + token
-        (quic_varint:encode(byte_size(Payload) + PNLen + 16))/binary  % +16 for AEAD tag
+        (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary  % +16 for AEAD tag
     >>,
 
     %% First byte: 1100 0000 | (PNLen - 1)
@@ -1056,7 +1059,7 @@ send_initial_packet(Payload, State) ->
 
     %% Encrypt payload
     #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, Payload),
+    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Apply header protection
     PNOffset = byte_size(Header),
@@ -1153,12 +1156,15 @@ send_handshake_packet(Payload, State) ->
     %% First byte for Handshake: 1110 0000 | (PNLen - 1)
     FirstByte = 16#E0 bor (PNLen - 1),
 
-    %% Build header
+    %% Pad payload if needed for header protection sampling
+    PaddedPayload = pad_for_header_protection(Payload),
+
+    %% Build header (length includes PN + encrypted payload + AEAD tag)
     HeaderBody = <<
         Version:32,
         (byte_size(DCID)):8, DCID/binary,
         (byte_size(SCID)):8, SCID/binary,
-        (quic_varint:encode(byte_size(Payload) + PNLen + 16))/binary
+        (quic_varint:encode(byte_size(PaddedPayload) + PNLen + 16))/binary
     >>,
     Header = <<FirstByte, HeaderBody/binary>>,
 
@@ -1168,7 +1174,7 @@ send_handshake_packet(Payload, State) ->
 
     %% Encrypt
     #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, Payload),
+    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
     PNOffset = byte_size(Header),
@@ -1215,9 +1221,12 @@ send_app_packet_internal(Payload, Frames, State) ->
     PNBin = quic_packet:encode_pn(PN, PNLen),
     AAD = <<Header/binary, PNBin/binary>>,
 
+    %% Pad payload if needed for header protection sampling
+    PaddedPayload = pad_for_header_protection(Payload),
+
     %% Encrypt
     #crypto_keys{key = Key, iv = IV, hp = HP} = ClientKeys,
-    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, Payload),
+    Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
     PNOffset = byte_size(Header),
@@ -1254,6 +1263,18 @@ pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
 pad_initial_packet(Packet) ->
     PadLen = 1200 - byte_size(Packet),
     <<Packet/binary, 0:PadLen/unit:8>>.
+
+%% Pad payload if needed for header protection sampling.
+%% Header protection requires a 16-byte sample from the encrypted payload.
+%% The sample starts at offset max(0, 4 - PNLen) into the ciphertext.
+%% With worst-case PNLen=1, we need at least 3 + 16 = 19 bytes of ciphertext.
+%% Since AEAD adds a 16-byte tag, plaintext needs to be >= 3 bytes.
+%% We pad to 4 bytes to be safe (using PADDING frames which are 0x00).
+pad_for_header_protection(Payload) when byte_size(Payload) >= 4 ->
+    Payload;
+pad_for_header_protection(Payload) ->
+    PadLen = 4 - byte_size(Payload),
+    <<Payload/binary, 0:PadLen/unit:8>>.
 
 %%====================================================================
 %% Internal Functions - Packet Processing
