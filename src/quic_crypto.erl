@@ -368,7 +368,7 @@ compute_shared_secret(Curve, OurPrivate, TheirPublic) ->
 
 %% @doc Verify the integrity tag of a Retry packet.
 %% RFC 9001 Section 5.8:
-%% - Retry Pseudo-Packet = <ODCID length> <ODCID> <Retry packet without tag>
+%% - Retry Pseudo-Packet = &lt;ODCID length&gt; &lt;ODCID&gt; &lt;Retry packet without tag&gt;
 %% - Tag = AES-128-GCM(Key, Nonce, AAD=Pseudo-Packet, "")
 %% Returns true if the tag is valid, false otherwise.
 -spec verify_retry_integrity_tag(binary(), binary(), non_neg_integer()) -> boolean().

@@ -16,7 +16,7 @@
 %%%
 %%% == ACK Ranges ==
 %%%
-%%% ACK ranges are stored as a list of {Start, End} tuples where Start <= End.
+%%% ACK ranges are stored as a list of {Start, End} tuples where Start =&lt; End.
 %%% The list is sorted in descending order by Start.
 %%% Example: [{100, 105}, {90, 95}, {80, 82}] acknowledges packets
 %%% 100-105, 90-95, and 80-82.

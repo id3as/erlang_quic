@@ -121,9 +121,9 @@ derive_psk(ResumptionSecret, #session_ticket{nonce = Nonce, cipher = Cipher}) ->
 %%   struct {
 %%       uint32 ticket_lifetime;
 %%       uint32 ticket_age_add;
-%%       opaque ticket_nonce<0..255>;
-%%       opaque ticket<1..2^16-1>;
-%%       Extension extensions<0..2^16-2>;
+%%       opaque ticket_nonce&lt;0..255&gt;;
+%%       opaque ticket&lt;1..2^16-1&gt;;
+%%       Extension extensions&lt;0..2^16-2&gt;;
 %%   } NewSessionTicket;
 -spec parse_new_session_ticket(binary()) ->
     {ok, #{lifetime := non_neg_integer(),
