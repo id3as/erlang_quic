@@ -60,7 +60,9 @@
                        ErrorCode :: non_neg_integer(),
                        FrameType :: non_neg_integer() | undefined,
                        Reason :: binary()} |
-    handshake_done.
+    handshake_done |
+    {datagram, Data :: binary()} |
+    {datagram_with_length, Data :: binary()}.
 
 -type ecn_counts() :: {ECT0 :: non_neg_integer(),
                        ECT1 :: non_neg_integer(),
@@ -206,7 +208,17 @@ encode({connection_close, application, ErrorCode, _FrameType, Reason}) ->
 
 %% HANDSHAKE_DONE (0x1e)
 encode(handshake_done) ->
-    <<?FRAME_HANDSHAKE_DONE>>.
+    <<?FRAME_HANDSHAKE_DONE>>;
+
+%% DATAGRAM (0x30 - no length, data to end of packet)
+encode({datagram, Data}) ->
+    <<?FRAME_DATAGRAM, Data/binary>>;
+
+%% DATAGRAM_WITH_LENGTH (0x31 - includes length)
+encode({datagram_with_length, Data}) ->
+    <<?FRAME_DATAGRAM_WITH_LEN,
+      (quic_varint:encode(byte_size(Data)))/binary,
+      Data/binary>>.
 
 %% @doc Decode a single frame from binary.
 %% Returns {Frame, Rest} or {error, Reason}.
@@ -356,6 +368,21 @@ decode(<<?FRAME_CONNECTION_CLOSE_APP, Rest/binary>>) ->
 
 decode(<<?FRAME_HANDSHAKE_DONE, Rest/binary>>) ->
     {handshake_done, Rest};
+
+%% DATAGRAM (0x30 - data extends to end of packet)
+decode(<<?FRAME_DATAGRAM, Data/binary>>) ->
+    {{datagram, Data}, <<>>};
+
+%% DATAGRAM_WITH_LENGTH (0x31)
+decode(<<?FRAME_DATAGRAM_WITH_LEN, Rest/binary>>) ->
+    {Length, Rest1} = quic_varint:decode(Rest),
+    case Length > ?MAX_FRAME_DATA_LEN of
+        true ->
+            {error, frame_too_large};
+        false ->
+            <<Data:Length/binary, Rest2/binary>> = Rest1,
+            {{datagram_with_length, Data}, Rest2}
+    end;
 
 decode(<<Type, _/binary>>) ->
     {error, {unknown_frame_type, Type}};

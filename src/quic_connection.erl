@@ -67,6 +67,7 @@
     start_link/5,
     connect/4,
     send_data/4,
+    send_datagram/2,
     open_stream/1,
     open_unidirectional_stream/1,
     close/2,
@@ -78,6 +79,8 @@
     get_state/1,
     peername/1,
     sockname/1,
+    peercert/1,
+    set_owner/2,
     setopts/2,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
@@ -225,6 +228,10 @@
     local_active_cid_limit = 2 :: non_neg_integer(),
     %% Peer's active CID limit - max CIDs we can issue to them (from their transport params)
     peer_active_cid_limit = 2 :: non_neg_integer(),
+
+    %% Peer certificate (received during TLS handshake)
+    peer_cert :: binary() | undefined,
+    peer_cert_chain = [] :: [binary()],
 
     %% Server-specific fields
     listener :: pid() | undefined,
@@ -378,6 +385,21 @@ peername(Conn) ->
 -spec sockname(pid()) -> {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
 sockname(Conn) ->
     gen_statem:call(Conn, sockname).
+
+%% @doc Get peer certificate (DER-encoded).
+-spec peercert(pid()) -> {ok, binary()} | {error, term()}.
+peercert(Conn) ->
+    gen_statem:call(Conn, peercert).
+
+%% @doc Set new owner process.
+-spec set_owner(pid(), pid()) -> ok | {error, term()}.
+set_owner(Conn, NewOwner) ->
+    gen_statem:call(Conn, {set_owner, NewOwner}).
+
+%% @doc Send a datagram.
+-spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
+send_datagram(Conn, Data) ->
+    gen_statem:call(Conn, {send_datagram, Data}).
 
 %% @doc Set connection options.
 -spec setopts(pid(), [{atom(), term()}]) -> ok | {error, term()}.
@@ -704,6 +726,23 @@ connected({call, From}, peername, #state{remote_addr = Addr} = State) ->
 connected({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
+connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
+    {keep_state, State, [{reply, From, {error, no_peercert}}]};
+connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
+    {keep_state, State, [{reply, From, {ok, Cert}}]};
+
+connected({call, From}, {set_owner, NewOwner}, State) ->
+    NewState = State#state{owner = NewOwner},
+    {keep_state, NewState, [{reply, From, ok}]};
+
+connected({call, From}, {send_datagram, Data}, State) ->
+    case do_send_datagram(Data, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     case do_send_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
@@ -768,6 +807,12 @@ connected(cast, {close, Reason}, State) ->
 connected(cast, process, State) ->
     inet:setopts(State#state.socket, [{active, once}]),
     {keep_state, State};
+
+%% Handle delayed ACK timer (RFC 9221 Section 5.2)
+connected(info, {send_delayed_ack, app}, State) ->
+    erase(ack_timer),
+    NewState = send_app_ack(State),
+    {keep_state, NewState};
 
 connected(EventType, EventContent, State) ->
     handle_common_event(EventType, EventContent, connected, State).
@@ -1290,11 +1335,13 @@ handle_packet_loop(<<>>, State) ->
     State;
 handle_packet_loop(Data, State) ->
     case decode_and_decrypt_packet(Data, State) of
-        {ok, _Type, Frames, RemainingData, NewState} ->
+        {ok, Type, Frames, RemainingData, NewState} ->
             %% Process frames from this packet
-            State1 = process_frames_noreenbl(_Type, Frames, NewState),
+            State1 = process_frames_noreenbl(Type, Frames, NewState),
+            %% Send ACK if packet contained ack-eliciting frames
+            State2 = maybe_send_ack(Type, Frames, State1),
             %% Continue with remaining coalesced packets
-            handle_packet_loop(RemainingData, State1);
+            handle_packet_loop(RemainingData, State2);
         {error, stateless_reset} ->
             %% RFC 9000 Section 10.3: Stateless reset received
             %% Immediately close the connection
@@ -1717,6 +1764,14 @@ process_frame(app, {retire_connection_id, SeqNum}, State) ->
 process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, State) ->
     State#state{close_reason = connection_closed};
 
+%% DATAGRAM frames (RFC 9221)
+process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
+    Owner ! {quic, Ref, {datagram, Data}},
+    State;
+process_frame(app, {datagram_with_length, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
+    Owner ! {quic, Ref, {datagram, Data}},
+    State;
+
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
@@ -1947,12 +2002,23 @@ process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State)
             }
     end;
 
-process_tls_message(_Level, ?TLS_CERTIFICATE, _Body, OriginalMsg, State) ->
+process_tls_message(_Level, ?TLS_CERTIFICATE, Body, OriginalMsg, State) ->
     %% Update transcript (we don't verify certs if verify = false)
     Transcript = <<(State#state.tls_transcript)/binary, OriginalMsg/binary>>,
+    %% Parse and store peer certificate
+    {PeerCert, PeerCertChain} = case quic_tls:parse_certificate(Body) of
+        {ok, #{certificates := [First | Rest]}} ->
+            {First, Rest};
+        {ok, #{certificates := []}} ->
+            {undefined, []};
+        {error, _} ->
+            {undefined, []}
+    end,
     State#state{
         tls_state = ?TLS_AWAITING_CERT_VERIFY,
-        tls_transcript = Transcript
+        tls_transcript = Transcript,
+        peer_cert = PeerCert,
+        peer_cert_chain = PeerCertChain
     };
 
 process_tls_message(_Level, ?TLS_CERTIFICATE_VERIFY, _Body, OriginalMsg, State) ->
@@ -2116,12 +2182,79 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
             State1
     end,
 
-    %% Send ACK for received data
-    send_app_ack(State2).
+    %% ACK is sent at packet level by maybe_send_ack
+    State2.
 
 %%====================================================================
 %% Internal Functions - Helpers
 %%====================================================================
+
+%% Send ACK if packet contained any ack-eliciting frames.
+%% Per RFC 9221 Section 5.2: Receivers SHOULD support delaying ACK frames
+%% for packets that only contain DATAGRAM frames.
+maybe_send_ack(app, Frames, State) ->
+    case contains_ack_eliciting_frames(Frames) of
+        true ->
+            case should_delay_ack(Frames) of
+                true ->
+                    %% Delay ACK for datagram-only packets (up to max_ack_delay)
+                    schedule_delayed_ack(app, State);
+                false ->
+                    send_app_ack(State)
+            end;
+        false ->
+            State
+    end;
+maybe_send_ack(handshake, Frames, State) ->
+    case contains_ack_eliciting_frames(Frames) of
+        true -> send_handshake_ack(State);
+        false -> State
+    end;
+maybe_send_ack(initial, Frames, State) ->
+    case contains_ack_eliciting_frames(Frames) of
+        true -> send_initial_ack(State);
+        false -> State
+    end;
+maybe_send_ack(_, _, State) ->
+    State.
+
+%% Per RFC 9221 Section 5.2: Delay ACKs for packets containing only
+%% non-retransmittable ack-eliciting frames (like DATAGRAM).
+should_delay_ack(Frames) ->
+    AckEliciting = [F || F <- Frames, is_ack_eliciting_frame(F)],
+    Retransmittable = quic_loss:retransmittable_frames(AckEliciting),
+    %% If all ack-eliciting frames are non-retransmittable, delay ACK
+    Retransmittable =:= [].
+
+%% Schedule a delayed ACK (up to max_ack_delay)
+schedule_delayed_ack(app, State) ->
+    %% Use max_ack_delay from transport params (default 25ms)
+    MaxAckDelay = maps:get(max_ack_delay, State#state.transport_params, 25),
+    %% Schedule ACK timer if not already set
+    case get(ack_timer) of
+        undefined ->
+            TimerRef = erlang:send_after(MaxAckDelay, self(), {send_delayed_ack, app}),
+            put(ack_timer, TimerRef),
+            State;
+        _ ->
+            %% Timer already set, don't reschedule
+            State
+    end.
+
+%% Check if any frame in the list is ack-eliciting
+contains_ack_eliciting_frames([]) -> false;
+contains_ack_eliciting_frames([Frame | Rest]) ->
+    case is_ack_eliciting_frame(Frame) of
+        true -> true;
+        false -> contains_ack_eliciting_frames(Rest)
+    end.
+
+%% Check if a decoded frame is ack-eliciting
+%% Per RFC 9002: ACK, PADDING, and CONNECTION_CLOSE are not ack-eliciting
+is_ack_eliciting_frame(padding) -> false;
+is_ack_eliciting_frame({ack, _, _, _}) -> false;
+is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
+is_ack_eliciting_frame(_) -> true.
 
 %% Check if a payload contains ack-eliciting frames
 %% ACK and PADDING are not ack-eliciting, everything else is
@@ -2344,6 +2477,23 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
 
 %% Estimate packet overhead (header + AEAD tag + frame header)
 -define(PACKET_OVERHEAD, 50).
+
+%% Send a datagram (RFC 9221)
+do_send_datagram(Data, #state{cc_state = CCState} = State) ->
+    DataBin = iolist_to_binary(Data),
+    PacketSize = byte_size(DataBin) + ?PACKET_OVERHEAD,
+
+    case quic_cc:can_send(CCState, PacketSize) of
+        true ->
+            %% Use datagram_with_length for better framing
+            Frame = {datagram_with_length, DataBin},
+            Payload = quic_frame:encode(Frame),
+            NewState = send_app_packet_internal(Payload, [Frame], State),
+            {ok, NewState};
+        false ->
+            %% Datagrams are unreliable - just drop if cwnd is full
+            {error, congestion_limited}
+    end.
 
 %% Send stream data in fragments that fit in packets
 %% Respects congestion window by checking before each send

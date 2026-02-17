@@ -13,6 +13,22 @@
 %%% - Initial packet routing to connections
 %%% - Connection ID management
 %%% - Stateless retry (optional)
+%%%
+%%% == Connection Handler Callback ==
+%%%
+%%% The `connection_handler' option allows custom handling of new connections:
+%%% ```
+%%% Opts = #{
+%%%     cert => Cert,
+%%%     key => Key,
+%%%     connection_handler => fun(ConnPid, ConnRef) ->
+%%%         %% Spawn your handler and return its pid
+%%%         HandlerPid = spawn(fun() -> my_handler(ConnPid, ConnRef) end),
+%%%         %% Ownership will be transferred to HandlerPid
+%%%         {ok, HandlerPid}
+%%%     end
+%%% }
+%%% '''
 
 -module(quic_listener).
 -behaviour(gen_server).
@@ -51,6 +67,8 @@
     connections :: ets:tid(),
     %% Stateless reset secret (RFC 9000 Section 10.3)
     reset_secret :: binary(),
+    %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
+    connection_handler :: fun((pid(), reference()) -> {ok, pid()}) | undefined,
     %% Options
     opts :: map()
 }).
@@ -96,6 +114,7 @@ init({Port, Opts}) ->
     CertChain = maps:get(cert_chain, Opts, []),
     PrivateKey = maps:get(key, Opts),
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
+    ConnHandler = maps:get(connection_handler, Opts, undefined),
 
     %% Open UDP socket
     SocketOpts = [
@@ -124,6 +143,7 @@ init({Port, Opts}) ->
                 alpn_list = ALPNList,
                 connections = Connections,
                 reset_secret = ResetSecret,
+                connection_handler = ConnHandler,
                 opts = Opts
             },
             {ok, State};
@@ -241,6 +261,7 @@ create_connection(Packet, DCID, RemoteAddr,
                       private_key = PrivateKey,
                       alpn_list = ALPNList,
                       connections = Conns,
+                      connection_handler = ConnHandler,
                       opts = Opts
                   }) ->
     %% Generate server connection ID
@@ -262,6 +283,9 @@ create_connection(Packet, DCID, RemoteAddr,
 
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of
         {ok, ConnPid} ->
+            %% Get connection reference
+            ConnRef = gen_statem:call(ConnPid, get_ref),
+
             %% Link to monitor connection
             link(ConnPid),
 
@@ -271,6 +295,20 @@ create_connection(Packet, DCID, RemoteAddr,
 
             %% Send initial packet to new connection
             send_to_connection(ConnPid, Packet, RemoteAddr),
+
+            %% Invoke connection handler callback if provided
+            case ConnHandler of
+                undefined ->
+                    ok;
+                Fun when is_function(Fun, 2) ->
+                    case Fun(ConnPid, ConnRef) of
+                        {ok, HandlerPid} when is_pid(HandlerPid) ->
+                            %% Transfer ownership to handler
+                            quic:set_owner(ConnRef, HandlerPid);
+                        _ ->
+                            ok
+                    end
+            end,
 
             {ok, ConnPid};
         {error, Reason} ->

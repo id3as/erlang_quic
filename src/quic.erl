@@ -26,6 +26,7 @@
 %%%   <li>`{quic, ConnRef, {session_ticket, Ticket}}' - Session ticket for 0-RTT</li>
 %%%   <li>`{quic, ConnRef, {send_ready, StreamId}}' - Stream ready to write</li>
 %%%   <li>`{quic, ConnRef, {timer, NextTimeoutMs}}' - Timer notification</li>
+%%%   <li>`{quic, ConnRef, {datagram, Data}}' - Datagram received (RFC 9221)</li>
 %%% </ul>
 %%%
 
@@ -42,6 +43,9 @@
     process/1,
     peername/1,
     sockname/1,
+    peercert/1,
+    set_owner/2,
+    send_datagram/2,
     setopts/2
 ]).
 
@@ -229,6 +233,48 @@ sockname(ConnRef) when is_reference(ConnRef) ->
     end;
 sockname(ConnPid) when is_pid(ConnPid) ->
     quic_connection:sockname(ConnPid).
+
+%% @doc Get the peer certificate.
+%% Returns the DER-encoded certificate of the peer if available.
+-spec peercert(ConnRef) -> {ok, binary()} | {error, term()}
+    when ConnRef :: reference() | pid().
+peercert(ConnRef) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:peercert(Pid);
+        error -> {error, not_found}
+    end;
+peercert(ConnPid) when is_pid(ConnPid) ->
+    quic_connection:peercert(ConnPid).
+
+%% @doc Set the owner process for a connection.
+%% Similar to gen_tcp:controlling_process/2.
+-spec set_owner(ConnRef, NewOwner) -> ok | {error, term()}
+    when ConnRef :: reference() | pid(),
+         NewOwner :: pid().
+set_owner(ConnRef, NewOwner) when is_reference(ConnRef), is_pid(NewOwner) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:set_owner(Pid, NewOwner);
+        error -> {error, not_found}
+    end;
+set_owner(ConnPid, NewOwner) when is_pid(ConnPid), is_pid(NewOwner) ->
+    quic_connection:set_owner(ConnPid, NewOwner);
+set_owner(_ConnRef, _NewOwner) ->
+    {error, badarg}.
+
+%% @doc Send a datagram on the connection.
+%% Datagrams are unreliable and may be lost.
+-spec send_datagram(ConnRef, Data) -> ok | {error, term()}
+    when ConnRef :: reference() | pid(),
+         Data :: iodata().
+send_datagram(ConnRef, Data) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:send_datagram(Pid, Data);
+        error -> {error, not_found}
+    end;
+send_datagram(ConnPid, Data) when is_pid(ConnPid) ->
+    quic_connection:send_datagram(ConnPid, Data);
+send_datagram(_ConnRef, _Data) ->
+    {error, badarg}.
 
 %% @doc Set connection options.
 -spec setopts(ConnRef, Opts) -> ok | {error, term()}

@@ -342,3 +342,28 @@ retransmittable_mixed_test() ->
         ping
     ],
     ?assertEqual(Expected, Result).
+
+%% DATAGRAM frames (RFC 9221) should never be retransmitted
+retransmittable_filters_datagram_test() ->
+    Frames = [
+        {datagram, <<"unreliable data">>},
+        {stream, 0, 0, <<"reliable data">>, false}
+    ],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([{stream, 0, 0, <<"reliable data">>, false}], Result).
+
+retransmittable_filters_datagram_with_length_test() ->
+    Frames = [
+        {datagram_with_length, <<"unreliable data">>},
+        ping
+    ],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([ping], Result).
+
+retransmittable_filters_all_datagrams_test() ->
+    Frames = [
+        {datagram, <<"data1">>},
+        {datagram_with_length, <<"data2">>}
+    ],
+    Result = quic_loss:retransmittable_frames(Frames),
+    ?assertEqual([], Result).

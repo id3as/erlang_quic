@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-02-17
+
+### Added
+- DATAGRAM frame support (RFC 9221) for unreliable data transmission
+- `quic:set_owner/2` to transfer connection ownership (like gen_tcp:controlling_process/2)
+- `quic:peercert/1` to retrieve peer certificate (DER-encoded)
+- `quic:send_datagram/2` to send QUIC datagrams
+- Connection handler callback in `quic_listener` for custom connection handling
+- ACK delay for datagram-only packets per RFC 9221 Section 5.2
+- Proper ACK generation at packet level for all ack-eliciting frames
+
+### Fixed
+- Datagrams are not retransmitted on loss (RFC 9221 compliance)
+- ACKs now sent for all ack-eliciting frames, not just stream data
+
 ## [0.5.1] - 2026-02-17
 
 ### Fixed

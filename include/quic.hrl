@@ -52,6 +52,10 @@
 -define(FRAME_CONNECTION_CLOSE_APP, 16#1d).
 -define(FRAME_HANDSHAKE_DONE, 16#1e).
 
+%% DATAGRAM Frames (RFC 9221)
+-define(FRAME_DATAGRAM, 16#30).
+-define(FRAME_DATAGRAM_WITH_LEN, 16#31).
+
 %%====================================================================
 %% Stream Frame Flags (bits 0-2 of frame type 0x08-0x0f)
 %%====================================================================

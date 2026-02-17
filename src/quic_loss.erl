@@ -407,4 +407,7 @@ is_retransmittable({ack, _, _, _}) -> false;
 is_retransmittable({ack, _, _, _, _}) -> false;
 is_retransmittable({ack_ecn, _, _, _, _, _, _, _}) -> false;
 is_retransmittable({connection_close, _, _, _, _}) -> false;
+%% DATAGRAM frames (RFC 9221) are unreliable and never retransmitted
+is_retransmittable({datagram, _}) -> false;
+is_retransmittable({datagram_with_length, _}) -> false;
 is_retransmittable(_) -> true.

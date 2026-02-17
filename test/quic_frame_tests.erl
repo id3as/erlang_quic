@@ -320,6 +320,57 @@ handshake_done_roundtrip_test() ->
     ?assertEqual(Frame, Decoded).
 
 %%====================================================================
+%% DATAGRAM Frames (0x30, 0x31) - RFC 9221
+%%====================================================================
+
+datagram_roundtrip_test() ->
+    Data = <<"Hello, unreliable world!">>,
+    Frame = {datagram, Data},
+    Encoded = quic_frame:encode(Frame),
+    ?assertMatch(<<16#30, _/binary>>, Encoded),
+    {Decoded, Rest} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded),
+    %% datagram without length consumes all remaining data
+    ?assertEqual(<<>>, Rest).
+
+datagram_empty_roundtrip_test() ->
+    Frame = {datagram, <<>>},
+    Encoded = quic_frame:encode(Frame),
+    ?assertEqual(<<16#30>>, Encoded),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+datagram_with_length_roundtrip_test() ->
+    Data = <<"Datagram with explicit length">>,
+    Frame = {datagram_with_length, Data},
+    Encoded = quic_frame:encode(Frame),
+    ?assertMatch(<<16#31, _/binary>>, Encoded),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+datagram_with_length_empty_roundtrip_test() ->
+    Frame = {datagram_with_length, <<>>},
+    Encoded = quic_frame:encode(Frame),
+    ?assertMatch(<<16#31, 0>>, Encoded),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+datagram_with_length_large_test() ->
+    %% Test with larger data
+    Data = crypto:strong_rand_bytes(1000),
+    Frame = {datagram_with_length, Data},
+    Encoded = quic_frame:encode(Frame),
+    {Decoded, <<>>} = quic_frame:decode(Encoded),
+    ?assertEqual(Frame, Decoded).
+
+datagram_with_trailing_data_test() ->
+    %% datagram_with_length should leave trailing data
+    Data = <<"short">>,
+    Frame = {datagram_with_length, Data},
+    Encoded = <<(quic_frame:encode(Frame))/binary, "trailing">>,
+    {{datagram_with_length, Data}, <<"trailing">>} = quic_frame:decode(Encoded).
+
+%%====================================================================
 %% decode_all tests
 %%====================================================================
 
