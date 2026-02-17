@@ -6,9 +6,9 @@ RUN apk add --no-cache git
 # Create working directory
 WORKDIR /build
 
-# Clone quic-go and build the echo example
-# Build from the repo root to handle the replace directive in example/go.mod
-RUN git clone --depth 1 https://github.com/quic-go/quic-go.git && \
+# Clone quic-go at a stable release and build the echo example
+# Use v0.48.x which supports Go 1.22+ (latest may require Go 1.25+)
+RUN git clone --depth 1 --branch v0.48.2 https://github.com/quic-go/quic-go.git && \
     cd quic-go && \
     go build -o /build/echo ./example/echo
 
