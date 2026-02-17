@@ -221,8 +221,10 @@
     local_cid_seq = 1 :: non_neg_integer(),
     %% Peer's CIDs that we can use (received via NEW_CONNECTION_ID)
     peer_cid_pool = [] :: [#cid_entry{}],
-    %% Active connection ID limit (from transport params)
-    active_cid_limit = 2 :: non_neg_integer(),
+    %% Local active CID limit - max peer CIDs we accept (advertised in our transport params)
+    local_active_cid_limit = 2 :: non_neg_integer(),
+    %% Peer's active CID limit - max CIDs we can issue to them (from their transport params)
+    peer_active_cid_limit = 2 :: non_neg_integer(),
 
     %% Server-specific fields
     listener :: pid() | undefined,
@@ -1676,7 +1678,13 @@ process_frame(app, {path_response, ResponseData}, State) ->
 
 %% NEW_CONNECTION_ID: Peer is providing a new CID for us to use
 process_frame(app, {new_connection_id, SeqNum, RetirePrior, CID, ResetToken}, State) ->
-    handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State);
+    case handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) of
+        {error, {connection_id_limit_error, _, _}} ->
+            %% RFC 9000: Exceeding active_connection_id_limit is a protocol error
+            State#state{close_reason = {protocol_violation, connection_id_limit_exceeded}};
+        NewState ->
+            NewState
+    end;
 
 %% RETIRE_CONNECTION_ID: Peer is retiring one of our CIDs
 process_frame(app, {retire_connection_id, SeqNum}, State) ->
@@ -1826,7 +1834,7 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Update DCID from ClientHello SCID
             ClientSCID = maps:get(scid, TP, <<>>),
 
-            State1 = State#state{
+            State0 = State#state{
                 dcid = ClientSCID,
                 tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
                 tls_transcript = Transcript,
@@ -1835,9 +1843,10 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
                 client_hs_secret = ClientHsSecret,
                 server_hs_secret = ServerHsSecret,
                 handshake_keys = {ClientHsKeys, ServerHsKeys},
-                alpn = ALPN,
-                transport_params = TP
+                alpn = ALPN
             },
+            %% Apply peer transport params (extracts active_connection_id_limit)
+            State1 = apply_peer_transport_params(TP, State0),
 
             %% Send ServerHello in Initial packet
             State2 = send_server_hello(ServerHello, State1),
@@ -1900,12 +1909,13 @@ process_tls_message(_Level, ?TLS_ENCRYPTED_EXTENSIONS, Body, OriginalMsg, State)
 
     case quic_tls:parse_encrypted_extensions(Body) of
         {ok, #{alpn := Alpn, transport_params := TP}} ->
-            State#state{
+            State0 = State#state{
                 tls_state = ?TLS_AWAITING_CERT,
                 tls_transcript = Transcript,
-                alpn = Alpn,
-                transport_params = TP
-            };
+                alpn = Alpn
+            },
+            %% Apply peer transport params (extracts active_connection_id_limit)
+            apply_peer_transport_params(TP, State0);
         _ ->
             State#state{
                 tls_state = ?TLS_AWAITING_CERT,
@@ -2782,8 +2792,9 @@ can_send_to_path(#path_state{bytes_sent = Sent, bytes_received = Recv}, Size, _S
 
 %% @doc Handle NEW_CONNECTION_ID frame from peer.
 %% Adds the new CID to our pool of peer CIDs.
+%% RFC 9000 Section 5.1.1: Peer must not exceed our active_connection_id_limit.
 handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
-    #state{peer_cid_pool = Pool, active_cid_limit = Limit} = State,
+    #state{peer_cid_pool = Pool, local_active_cid_limit = Limit} = State,
 
     %% Retire CIDs with seq < RetirePrior
     RetiredPool = lists:map(
@@ -2804,36 +2815,23 @@ handle_new_connection_id(SeqNum, RetirePrior, CID, ResetToken, State) ->
     %% Check if already exists
     case lists:keyfind(SeqNum, #cid_entry.seq_num, RetiredPool) of
         false ->
-            %% Add new entry, keeping within limit
+            %% Add new entry
             NewPool = [NewEntry | RetiredPool],
+            %% Count active CIDs after retirement
             ActiveCount = length([E || #cid_entry{status = active} = E <- NewPool]),
-            FinalPool = if
-                ActiveCount > Limit ->
-                    %% Remove oldest active CID if over limit
-                    trim_cid_pool(NewPool, Limit);
+            %% RFC 9000: Peer must not exceed our limit
+            case ActiveCount > Limit of
                 true ->
-                    NewPool
-            end,
-            %% Send RETIRE_CONNECTION_ID for CIDs with seq < RetirePrior
-            State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = FinalPool}),
-            State1;
+                    %% Protocol violation - close connection
+                    {error, {connection_id_limit_error, ActiveCount, Limit}};
+                false ->
+                    %% Send RETIRE_CONNECTION_ID for CIDs with seq < RetirePrior
+                    State1 = retire_peer_cids(RetirePrior, State#state{peer_cid_pool = NewPool}),
+                    State1
+            end;
         _ ->
             %% Duplicate, ignore
             State#state{peer_cid_pool = RetiredPool}
-    end.
-
-%% Trim CID pool to active limit by retiring oldest
-trim_cid_pool(Pool, Limit) ->
-    Active = [E || #cid_entry{status = active} = E <- Pool],
-    Retired = [E || #cid_entry{status = retired} = E <- Pool],
-    Sorted = lists:sort(fun(A, B) -> A#cid_entry.seq_num < B#cid_entry.seq_num end, Active),
-    case length(Sorted) > Limit of
-        true ->
-            {ToRetire, ToKeep} = lists:split(length(Sorted) - Limit, Sorted),
-            NewRetired = [E#cid_entry{status = retired} || E <- ToRetire],
-            NewRetired ++ ToKeep ++ Retired;
-        false ->
-            Pool
     end.
 
 %% Send RETIRE_CONNECTION_ID frames for CIDs that need to be retired
@@ -2841,6 +2839,16 @@ retire_peer_cids(_RetirePrior, State) ->
     %% In a full implementation, send RETIRE_CONNECTION_ID frames
     %% For now, just return state
     State.
+
+%% @doc Apply peer transport parameters to connection state.
+%% Extracts and stores the peer's active_connection_id_limit.
+apply_peer_transport_params(TransportParams, State) ->
+    %% Extract peer's active_connection_id_limit (default: 2 per RFC 9000)
+    PeerLimit = maps:get(active_connection_id_limit, TransportParams, 2),
+    State#state{
+        transport_params = TransportParams,
+        peer_active_cid_limit = PeerLimit
+    }.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.
 %% Marks the specified CID in our local pool as retired.
@@ -2856,14 +2864,15 @@ handle_retire_connection_id(SeqNum, State) ->
 
 %% @doc Issue a new connection ID to the peer.
 %% Sends NEW_CONNECTION_ID frame with a new CID.
+%% RFC 9000: We must not issue more CIDs than peer's active_connection_id_limit.
 issue_new_connection_id(State) ->
     #state{
         local_cid_pool = Pool,
         local_cid_seq = Seq,
-        active_cid_limit = Limit
+        peer_active_cid_limit = Limit
     } = State,
 
-    %% Check if we can issue more CIDs
+    %% Check if we can issue more CIDs (respecting peer's limit)
     ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
     case ActiveCount < Limit of
         true ->
