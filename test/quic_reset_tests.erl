@@ -110,11 +110,6 @@ reset_detection_match_test() ->
     CID = crypto:strong_rand_bytes(8),
     Token = compute_reset_token(Secret, CID),
 
-    %% Build a packet that looks like a reset
-    RandomPart = crypto:strong_rand_bytes(20),
-    FirstByte = 16#40,  % Short header with fixed bit
-    Packet = <<FirstByte, RandomPart/binary, Token/binary>>,
-
     %% Create mock CID entry
     CIDEntry = #cid_entry{
         seq_num = 0,

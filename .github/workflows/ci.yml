@@ -13,7 +13,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp: ['26.0', '27.0', '28.0']
+        include:
+          - otp: '26.0'
+            rebar3: '3.24.0'
+          - otp: '27.0'
+            rebar3: '3.24.0'
+          - otp: '28.0'
+            rebar3: 'nightly'
 
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +28,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ matrix.otp }}
-          rebar3-version: '3.24.0'
+          rebar3-version: ${{ matrix.rebar3 }}
 
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -56,7 +62,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           otp-version: '28.0'
-          rebar3-version: '3.24.0'
+          rebar3-version: 'nightly'
 
       - name: Restore PLT cache
         uses: actions/cache@v4
@@ -84,7 +90,7 @@ jobs:
         uses: erlef/setup-beam@v1
         with:
           otp-version: '28.0'
-          rebar3-version: '3.24.0'
+          rebar3-version: 'nightly'
 
       - name: Run XRef
         run: rebar3 xref

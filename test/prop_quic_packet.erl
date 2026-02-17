@@ -25,10 +25,6 @@ packet_number() ->
 version() ->
     oneof([?QUIC_VERSION_1, ?QUIC_VERSION_2]).
 
-%% Token (for Initial packets)
-token() ->
-    ?LET(Len, range(0, 50), binary(Len)).
-
 %% Payload
 payload() ->
     ?LET(Len, range(1, 500), binary(Len)).
