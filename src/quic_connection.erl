@@ -431,7 +431,8 @@ init([Host, Port, Opts, Owner, Socket]) ->
     RemoteAddr = resolve_address(Host, Port),
 
     %% Create or use provided socket with proper cleanup on failure
-    case open_client_socket(Socket) of
+    %% Pass RemoteAddr to match address family (IPv4 vs IPv6)
+    case open_client_socket(Socket, RemoteAddr) of
         {ok, Sock, LocalAddr, OwnsSocket} ->
             try
                 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr)
@@ -525,8 +526,10 @@ init({server, Opts}) ->
     {ok, idle, State}.
 
 %% Helper to open or use provided socket for client
-open_client_socket(undefined) ->
-    case gen_udp:open(0, [binary, {active, false}]) of
+%% Match address family based on the remote address
+open_client_socket(undefined, {IP, _Port}) ->
+    AddrFamily = address_family(IP),
+    case gen_udp:open(0, [binary, AddrFamily, {active, false}]) of
         {ok, S} ->
             case inet:sockname(S) of
                 {ok, LA} -> {ok, S, LA, true};
@@ -537,11 +540,15 @@ open_client_socket(undefined) ->
         {error, Reason} ->
             {error, Reason}
     end;
-open_client_socket(S) ->
+open_client_socket(S, _RemoteAddr) ->
     case inet:sockname(S) of
         {ok, LA} -> {ok, S, LA, false};
         {error, Reason} -> {error, Reason}
     end.
+
+%% Determine address family from IP tuple
+address_family(IP) when tuple_size(IP) =:= 4 -> inet;
+address_family(IP) when tuple_size(IP) =:= 8 -> inet6.
 
 %% Continue client initialization after socket is ready
 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
@@ -652,6 +659,10 @@ idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
 idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
+idle({call, From}, {set_owner, NewOwner}, State) ->
+    NewState = State#state{owner = NewOwner},
+    {keep_state, NewState, [{reply, From, ok}]};
+
 idle(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
     check_state_transition(idle, NewState);
@@ -686,6 +697,10 @@ handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
 
 handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
+
+handshaking({call, From}, {set_owner, NewOwner}, State) ->
+    NewState = State#state{owner = NewOwner},
+    {keep_state, NewState, [{reply, From, ok}]};
 
 handshaking(info, {udp, Socket, _IP, _Port, Data}, #state{socket = Socket} = State) ->
     NewState = handle_packet(Data, State),
@@ -1605,8 +1620,14 @@ decrypt_app_packet(Header, EncryptedPayload, ServerKeys, State) ->
 
     %% Remove header protection using current keys
     PNOffset = byte_size(Header),
-    {UnprotectedHeader, PNLen} = quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset),
+    case quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+        {error, Reason} ->
+            {error, {header_unprotect_failed, Reason}};
+        {UnprotectedHeader, PNLen} ->
+            decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State)
+    end.
 
+decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) ->
     %% Extract the unprotected first byte to get key_phase
     <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
     ReceivedKeyPhase = quic_packet:decode_short_key_phase(UnprotectedFirstByte),
@@ -1644,8 +1665,15 @@ decrypt_packet(Level, Header, _FirstByte, EncryptedPayload, RemainingData, Keys,
     %% Remove header protection
     %% unprotect_header returns UnprotectedHeader which includes the unprotected PN at the end
     PNOffset = byte_size(Header),
-    {UnprotectedHeader, PNLen} = quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset),
+    case quic_aead:unprotect_header(HP, Header, EncryptedPayload, PNOffset) of
+        {error, Reason} ->
+            {error, {header_unprotect_failed, Reason}};
+        {UnprotectedHeader, PNLen} ->
+            decrypt_packet_continue(Level, UnprotectedHeader, PNLen, EncryptedPayload,
+                                    RemainingData, Key, IV, State)
+    end.
 
+decrypt_packet_continue(Level, UnprotectedHeader, PNLen, EncryptedPayload, RemainingData, Key, IV, State) ->
     %% Extract unprotected PN from the end of UnprotectedHeader
     UnprotHeaderLen = byte_size(UnprotectedHeader),
     <<_:((UnprotHeaderLen - PNLen) * 8), PN:PNLen/unit:8>> = UnprotectedHeader,

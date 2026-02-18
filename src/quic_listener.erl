@@ -39,6 +39,7 @@
 
 -export([
     start_link/2,
+    start/2,
     stop/1,
     get_port/1,
     get_connections/1
@@ -87,6 +88,11 @@
 start_link(Port, Opts) ->
     gen_server:start_link(?MODULE, {Port, Opts}, []).
 
+%% @doc Start a QUIC listener (without linking to caller).
+-spec start(inet:port_number(), map()) -> {ok, pid()} | {error, term()}.
+start(Port, Opts) ->
+    gen_server:start(?MODULE, {Port, Opts}, []).
+
 %% @doc Stop the listener.
 -spec stop(pid()) -> ok.
 stop(Listener) ->
@@ -117,43 +123,50 @@ init({Port, Opts}) ->
     ConnHandler = maps:get(connection_handler, Opts, undefined),
 
     %% Open UDP socket
+    %% Default to IPv4 for maximum compatibility
     SocketOpts = [
         binary,
+        inet,
         {active, true},
         {reuseaddr, true}
     ],
-
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
-            %% Get actual port (useful if Port was 0)
-            {ok, ActualPort} = inet:port(Socket),
-            error_logger:info_msg("Listener started on port ~p, socket=~p~n", [ActualPort, Socket]),
-
-            %% Create ETS table for connection tracking
-            Connections = ets:new(quic_connections, [set, protected]),
-
-            %% Generate or use provided stateless reset secret
-            ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
-
-            State = #listener_state{
-                socket = Socket,
-                port = ActualPort,
-                cert = Cert,
-                cert_chain = CertChain,
-                private_key = PrivateKey,
-                alpn_list = ALPNList,
-                connections = Connections,
-                reset_secret = ResetSecret,
-                connection_handler = ConnHandler,
-                opts = Opts
-            },
-            {ok, State};
+            init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, Opts);
         {error, Reason} ->
             {stop, Reason}
     end.
 
+init_listener_state(Socket, Cert, CertChain, PrivateKey, ALPNList, ConnHandler, Opts) ->
+    %% Get actual port and bound address
+    {ok, {_BoundAddr, ActualPort}} = inet:sockname(Socket),
+
+    %% Create ETS table for connection tracking
+    Connections = ets:new(quic_connections, [set, protected]),
+
+    %% Generate or use provided stateless reset secret
+    ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
+
+    State = #listener_state{
+        socket = Socket,
+        port = ActualPort,
+        cert = Cert,
+        cert_chain = CertChain,
+        private_key = PrivateKey,
+        alpn_list = ALPNList,
+        connections = Connections,
+        reset_secret = ResetSecret,
+        connection_handler = ConnHandler,
+        opts = Opts
+    },
+    {ok, State}.
+
 handle_call(get_port, _From, #listener_state{port = Port} = State) ->
     {reply, Port, State};
+
+handle_call(get_socket_info, _From, #listener_state{socket = Socket, port = Port} = State) ->
+    SockInfo = inet:info(Socket),
+    {reply, #{port => Port, socket => Socket, info => SockInfo}, State};
 
 handle_call(get_connections, _From, #listener_state{connections = Conns} = State) ->
     Pids = ets:foldl(fun({_CID, Pid}, Acc) -> [Pid | Acc] end, [], Conns),
@@ -168,9 +181,11 @@ handle_cast(_Msg, State) ->
 %% Handle incoming UDP packets
 handle_info({udp, Socket, SrcIP, SrcPort, Packet},
             #listener_state{socket = Socket} = State) ->
-    error_logger:info_msg("Listener received UDP packet from ~p:~p, size=~p~n",
-                          [SrcIP, SrcPort, byte_size(Packet)]),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
+    {noreply, State};
+
+%% Handle UDP from different socket (shouldn't happen)
+handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
 
 %% Handle connection process exit
@@ -183,8 +198,7 @@ handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State
     lists:foreach(fun(CID) -> ets:delete(Conns, CID) end, ToDelete),
     {noreply, State};
 
-handle_info(Info, State) ->
-    error_logger:info_msg("Listener got unexpected info: ~p~n", [Info]),
+handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #listener_state{socket = Socket, connections = Conns}) ->
@@ -202,16 +216,12 @@ code_change(_OldVsn, State, _Extra) ->
 handle_packet(Packet, RemoteAddr, State) ->
     case parse_packet_header(Packet) of
         {initial, DCID, _SCID, _Rest} ->
-            error_logger:info_msg("Listener: Initial packet, DCID=~p~n", [DCID]),
             handle_initial_packet(Packet, DCID, RemoteAddr, State);
         {short, DCID, _Rest} ->
-            error_logger:info_msg("Listener: Short header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, _PacketType, _Rest} ->
-            error_logger:info_msg("Listener: Long header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
-        {error, Reason} ->
-            error_logger:info_msg("Listener: Error parsing packet: ~p~n", [Reason]),
+        {error, _Reason} ->
             %% Drop malformed packets
             ok
     end.
