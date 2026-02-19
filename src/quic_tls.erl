@@ -875,7 +875,11 @@ convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, {namedCurve, {1,3,132
 convert_private_key(ecdsa, {'ECPrivateKey', _, PrivKeyBin, _, _, _}) ->
     %% Default EC curve
     [PrivKeyBin, secp256r1];
-convert_private_key(rsa, Key) ->
+convert_private_key(rsa, {'RSAPrivateKey', _, N, E, D, _P, _Q, _Dp, _Dq, _Qi, _}) ->
+    %% crypto:sign expects [E, N, D] list format for RSA
+    [E, N, D];
+convert_private_key(rsa, Key) when is_list(Key) ->
+    %% Already in list format
     Key;
 convert_private_key(_, Key) ->
     Key.

@@ -66,9 +66,13 @@ run_server(TestCase, Port, CertsDir, WwwDir) ->
     KeyFile = filename:join(CertsDir, "priv.key"),
 
     case {file:read_file(CertFile), file:read_file(KeyFile)} of
-        {{ok, Cert}, {ok, Key}} ->
+        {{ok, CertPem}, {ok, KeyPem}} ->
+            %% Decode PEM to DER
+            [{_, CertDer, _}] = public_key:pem_decode(CertPem),
+            PrivateKey = decode_private_key(KeyPem),
+
             %% Build server options
-            Opts = build_server_opts(TestCase, Cert, Key, WwwDir),
+            Opts = build_server_opts(TestCase, CertDer, PrivateKey, WwwDir),
 
             %% Start listener
             case quic_listener:start_link(Port, Opts) of
@@ -113,6 +117,28 @@ build_server_opts(TestCase, Cert, Key, WwwDir) ->
         _ ->
             BaseOpts
     end.
+
+%% Decode PEM-encoded private key to internal format
+decode_private_key(PemData) ->
+    case public_key:pem_decode(PemData) of
+        [{Type, Der, not_encrypted}] ->
+            decode_key_entry(Type, Der);
+        [{Type, Der, _Cipher}] ->
+            %% Encrypted key - not supported yet
+            decode_key_entry(Type, Der);
+        _ ->
+            error(invalid_private_key)
+    end.
+
+decode_key_entry('RSAPrivateKey', Der) ->
+    public_key:der_decode('RSAPrivateKey', Der);
+decode_key_entry('ECPrivateKey', Der) ->
+    public_key:der_decode('ECPrivateKey', Der);
+decode_key_entry('PrivateKeyInfo', Der) ->
+    %% PKCS#8 format - public_key:der_decode handles extraction automatically
+    public_key:der_decode('PrivateKeyInfo', Der);
+decode_key_entry(Type, _Der) ->
+    error({unsupported_key_type, Type}).
 
 spawn_handler(ConnPid, ConnRef, WwwDir, TestCase) ->
     HandlerPid = spawn(fun() ->
