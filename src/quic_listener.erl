@@ -339,9 +339,26 @@ create_connection(Packet, DCID, RemoteAddr,
                 undefined ->
                     ok;
                 Fun when is_function(Fun, 2) ->
-                    {ok, HandlerPid} = Fun(ConnPid, ConnRef),
-                    %% Transfer ownership to handler
-                    quic:set_owner(ConnRef, HandlerPid)
+                    case Fun(ConnPid, ConnRef) of
+                        {ok, HandlerPid} when is_pid(HandlerPid) ->
+                            %% Transfer ownership to handler
+                            case quic:set_owner(ConnRef, HandlerPid) of
+                                ok ->
+                                    ok;
+                                {error, Reason} ->
+                                    error_logger:warning_msg(
+                                        "QUIC listener: failed to set owner for ~p: ~p~n",
+                                        [ConnRef, Reason])
+                            end;
+                        {error, HandlerError} ->
+                            error_logger:warning_msg(
+                                "QUIC listener: connection_handler failed: ~p~n",
+                                [HandlerError]);
+                        Other ->
+                            error_logger:warning_msg(
+                                "QUIC listener: connection_handler returned unexpected: ~p~n",
+                                [Other])
+                    end
             end,
 
             %% Send initial packet to new connection (after ownership transfer)

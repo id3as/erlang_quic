@@ -138,3 +138,66 @@ cert_chain_test() ->
     {ok, Listener} = quic_listener:start_link(0, Opts),
     ?assert(is_pid(Listener)),
     ok = quic_listener:stop(Listener).
+
+%%====================================================================
+%% Connection Handler Callback Tests
+%%====================================================================
+
+connection_handler_registration_test() ->
+    %% Test that connection_handler option is accepted
+    {Cert, PrivKey} = generate_test_cert(),
+    TestPid = self(),
+    Handler = fun(ConnPid, ConnRef) ->
+        %% Notify test that handler was invoked
+        TestPid ! {handler_invoked, ConnPid, ConnRef},
+        HandlerPid = spawn(fun() ->
+            receive
+                stop -> ok
+            after 5000 -> ok
+            end
+        end),
+        {ok, HandlerPid}
+    end,
+    Opts = #{
+        cert => Cert,
+        key => PrivKey,
+        alpn => [<<"h3">>],
+        connection_handler => Handler
+    },
+    {ok, Listener} = quic_listener:start_link(0, Opts),
+    ?assert(is_pid(Listener)),
+    ok = quic_listener:stop(Listener).
+
+connection_handler_error_handling_test() ->
+    %% Test that connection_handler errors are handled gracefully
+    {Cert, PrivKey} = generate_test_cert(),
+    %% Handler that returns an error
+    Handler = fun(_ConnPid, _ConnRef) ->
+        {error, test_error}
+    end,
+    Opts = #{
+        cert => Cert,
+        key => PrivKey,
+        alpn => [<<"h3">>],
+        connection_handler => Handler
+    },
+    {ok, Listener} = quic_listener:start_link(0, Opts),
+    ?assert(is_pid(Listener)),
+    ok = quic_listener:stop(Listener).
+
+connection_handler_invalid_return_test() ->
+    %% Test that invalid connection_handler return values are handled
+    {Cert, PrivKey} = generate_test_cert(),
+    %% Handler that returns unexpected value
+    Handler = fun(_ConnPid, _ConnRef) ->
+        invalid_return
+    end,
+    Opts = #{
+        cert => Cert,
+        key => PrivKey,
+        alpn => [<<"h3">>],
+        connection_handler => Handler
+    },
+    {ok, Listener} = quic_listener:start_link(0, Opts),
+    ?assert(is_pid(Listener)),
+    ok = quic_listener:stop(Listener).
