@@ -264,7 +264,10 @@
     %% 0-RTT / Early Data (RFC 9001 Section 4.6)
     early_keys :: {#crypto_keys{}, binary()} | undefined,  % {Keys, EarlySecret}
     early_data_sent = 0 :: non_neg_integer(),  % Bytes of early data sent
-    early_data_accepted = false :: boolean()   % Server accepted early data
+    early_data_accepted = false :: boolean(),  % Server accepted early data
+
+    %% QUIC-LB CID configuration (RFC 9312)
+    cid_config :: #cid_config{} | undefined
 }).
 
 %%====================================================================
@@ -570,7 +573,8 @@ init({server, Opts}) ->
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
-        server_preferred_address = build_server_preferred_address(Opts)
+        server_preferred_address = build_server_preferred_address(Opts),
+        cid_config = maps:get(cid_config, Opts, undefined)
     },
 
     {ok, idle, State}.
@@ -583,8 +587,9 @@ build_server_preferred_address(Opts) ->
         {undefined, undefined} ->
             undefined;
         _ ->
-            %% Generate new CID and stateless reset token for preferred address
-            CID = crypto:strong_rand_bytes(8),
+            %% Generate new CID (LB-aware if configured) and stateless reset token
+            CIDConfig = maps:get(cid_config, Opts, undefined),
+            CID = generate_connection_id(CIDConfig),
             Token = crypto:strong_rand_bytes(16),
             {IPv4Addr, IPv4Port} = case PreferredIPv4 of
                 {Addr, Port} -> {Addr, Port};
@@ -2957,9 +2962,15 @@ check_persistent_congestion(LostPackets, LossState, CCState) ->
             CCState
     end.
 
-%% Generate a random connection ID (8-20 bytes, using 8)
+%% Generate a connection ID
+%% Uses LB config if available, otherwise random 8 bytes
 generate_connection_id() ->
     crypto:strong_rand_bytes(8).
+
+generate_connection_id(undefined) ->
+    crypto:strong_rand_bytes(8);
+generate_connection_id(#cid_config{} = Config) ->
+    quic_lb:generate_cid(Config).
 
 %% Resolve hostname to IP address
 resolve_address(Host, Port) when is_tuple(Host) ->
@@ -4084,15 +4095,16 @@ issue_new_connection_id(State) ->
     #state{
         local_cid_pool = Pool,
         local_cid_seq = Seq,
-        peer_active_cid_limit = Limit
+        peer_active_cid_limit = Limit,
+        cid_config = CIDConfig
     } = State,
 
     %% Check if we can issue more CIDs (respecting peer's limit)
     ActiveCount = length([E || #cid_entry{status = active} = E <- Pool]),
     case ActiveCount < Limit of
         true ->
-            %% Generate new CID and reset token
-            NewCID = crypto:strong_rand_bytes(8),
+            %% Generate new CID (LB-aware if configured) and reset token
+            NewCID = generate_connection_id(CIDConfig),
             ResetToken = crypto:strong_rand_bytes(16),
 
             NewEntry = #cid_entry{

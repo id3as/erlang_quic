@@ -74,6 +74,10 @@
     reset_secret :: binary(),
     %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
     connection_handler :: fun((pid(), reference()) -> {ok, pid()}) | undefined,
+    %% QUIC-LB CID configuration (RFC 9312)
+    cid_config :: #cid_config{} | undefined,
+    %% Expected DCID length for short header packets
+    dcid_len = 8 :: pos_integer(),
     %% Options
     opts :: map()
 }).
@@ -165,6 +169,9 @@ handle_continue(discover_manager, {Socket, Opts}) ->
     %% Generate or use provided stateless reset secret
     ResetSecret = maps:get(reset_secret, Opts, crypto:strong_rand_bytes(32)),
 
+    %% Initialize QUIC-LB CID configuration (RFC 9312)
+    {CIDConfig, DCIDLen} = init_cid_config(Opts, ResetSecret),
+
     State = #listener_state{
         socket = Socket,
         port = ActualPort,
@@ -176,6 +183,8 @@ handle_continue(discover_manager, {Socket, Opts}) ->
         tickets_table = TicketTab,
         reset_secret = ResetSecret,
         connection_handler = ConnHandler,
+        cid_config = CIDConfig,
+        dcid_len = DCIDLen,
         opts = Opts
     },
     {noreply, State}.
@@ -241,6 +250,53 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal Functions
 %%====================================================================
 
+%% Initialize QUIC-LB CID configuration from options
+%% Returns {CIDConfig | undefined, DCIDLen}
+init_cid_config(Opts, ResetSecret) ->
+    case maps:get(lb_config, Opts, undefined) of
+        undefined ->
+            %% No LB config - use default random CIDs
+            DCIDLen = maps:get(cid_len, Opts, 8),
+            {undefined, DCIDLen};
+        LBConfig when is_map(LBConfig) ->
+            %% LB config provided as map - create config
+            case quic_lb:new_config(LBConfig) of
+                {ok, LBCfg} ->
+                    CIDLen = quic_lb:expected_cid_len(LBCfg),
+                    case quic_lb:new_cid_config(#{
+                        lb_config => LBCfg,
+                        cid_len => CIDLen,
+                        reset_secret => ResetSecret
+                    }) of
+                        {ok, CIDConfig} ->
+                            {CIDConfig, CIDLen};
+                        {error, Reason} ->
+                            error_logger:warning_msg(
+                                "QUIC listener: invalid CID config: ~p~n", [Reason]),
+                            {undefined, 8}
+                    end;
+                {error, Reason} ->
+                    error_logger:warning_msg(
+                        "QUIC listener: invalid LB config: ~p~n", [Reason]),
+                    {undefined, 8}
+            end;
+        #lb_config{} = LBCfg ->
+            %% LB config provided as record
+            CIDLen = quic_lb:expected_cid_len(LBCfg),
+            case quic_lb:new_cid_config(#{
+                lb_config => LBCfg,
+                cid_len => CIDLen,
+                reset_secret => ResetSecret
+            }) of
+                {ok, CIDConfig} ->
+                    {CIDConfig, CIDLen};
+                {error, Reason} ->
+                    error_logger:warning_msg(
+                        "QUIC listener: invalid CID config: ~p~n", [Reason]),
+                    {undefined, 8}
+            end
+    end.
+
 %% Remove all CIDs associated with this connection
 cleanup_connection(Conns, Pid) ->
     Pattern = {{'_', Pid}, [], [true]},
@@ -259,8 +315,8 @@ get_tables(_) ->
     TicketTab = ets:new(quic_connections, [set, protected]),
     {ConnTab, TicketTab}.
 
-handle_packet(Packet, RemoteAddr, State) ->
-    case parse_packet_header(Packet) of
+handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
+    case parse_packet_header(Packet, DCIDLen) of
         {initial, DCID, _SCID, _Rest} ->
             handle_initial_packet(Packet, DCID, RemoteAddr, State);
         {short, DCID, _Rest} ->
@@ -273,24 +329,24 @@ handle_packet(Packet, RemoteAddr, State) ->
     end.
 
 %% Parse packet header to extract DCID for routing
-parse_packet_header(<<1:1, _:7, _Version:32, DCIDLen, DCID:DCIDLen/binary,
-                      SCIDLen, SCID:SCIDLen/binary, Rest/binary>>) ->
-    %% Long header - check packet type
+%% DCIDLen parameter specifies expected DCID length for short header packets
+parse_packet_header(<<1:1, _:7, _Version:32, DCIDLenField, DCID:DCIDLenField/binary,
+                      SCIDLen, SCID:SCIDLen/binary, Rest/binary>>, _DCIDLen) ->
+    %% Long header - DCID length is in the packet
     <<_:1, PacketType:2, _:5, _/binary>> = <<1:1, 0:7>>,
     case PacketType of
         0 -> {initial, DCID, SCID, Rest};
         _ -> {long, DCID, SCID, PacketType, Rest}
     end;
-parse_packet_header(<<0:1, _:7, Rest/binary>>) ->
-    %% Short header - DCID length is connection-specific
-    %% For now, assume 8-byte DCID
+parse_packet_header(<<0:1, _:7, Rest/binary>>, DCIDLen) ->
+    %% Short header - use configured DCID length
     case Rest of
-        <<DCID:8/binary, Remaining/binary>> ->
+        <<DCID:DCIDLen/binary, Remaining/binary>> ->
             {short, DCID, Remaining};
         _ ->
             {error, short_header_too_small}
     end;
-parse_packet_header(_) ->
+parse_packet_header(_, _DCIDLen) ->
     {error, invalid_header}.
 
 %% Handle Initial packet - may create new connection
@@ -326,10 +382,14 @@ create_connection(Packet, DCID, RemoteAddr,
                       alpn_list = ALPNList,
                       connections = Conns,
                       connection_handler = ConnHandler,
+                      cid_config = CIDConfig,
                       opts = Opts
                   }) ->
-    %% Generate server connection ID
-    ServerCID = crypto:strong_rand_bytes(8),
+    %% Generate server connection ID (LB-aware if configured)
+    ServerCID = case CIDConfig of
+        undefined -> crypto:strong_rand_bytes(8);
+        #cid_config{} -> quic_lb:generate_cid(CIDConfig)
+    end,
 
     %% Start connection process
     ConnOpts = #{
@@ -342,7 +402,8 @@ create_connection(Packet, DCID, RemoteAddr,
         cert_chain => CertChain,
         private_key => PrivateKey,
         alpn => ALPNList,
-        listener => self()
+        listener => self(),
+        cid_config => CIDConfig
     },
 
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of

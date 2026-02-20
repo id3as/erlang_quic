@@ -492,4 +492,45 @@
     transport_params :: map()
 }).
 
+%%====================================================================
+%% QUIC-LB (RFC 9312) - QUIC Load Balancer Configuration
+%%====================================================================
+
+%% Config Rotation for unroutable packets (CR bits = 0b111)
+-define(LB_CR_UNROUTABLE, 7).
+%% Maximum server ID length (1-15 bytes)
+-define(LB_MAX_SERVER_ID_LEN, 15).
+%% Maximum nonce length (4-18 bytes)
+-define(LB_MAX_NONCE_LEN, 18).
+%% Minimum nonce length
+-define(LB_MIN_NONCE_LEN, 4).
+
+%% QUIC-LB Configuration record
+%% Defines how the load balancer encodes server identity in CIDs
+-record(lb_config, {
+    %% Config rotation bits (0-6, 7 = unroutable)
+    config_rotation = 0 :: 0..6,
+    %% Encoding algorithm
+    algorithm = plaintext :: plaintext | stream_cipher | block_cipher,
+    %% Server ID (1-15 bytes identifying this server)
+    server_id :: binary(),
+    %% Length of server ID in bytes
+    server_id_len :: 1..15,
+    %% Length of nonce in bytes (4-18)
+    nonce_len = 4 :: 4..18,
+    %% Encryption key (16 bytes for AES-128, required for cipher algorithms)
+    key :: binary() | undefined
+}).
+
+%% CID generation configuration record
+%% Combines LB config with additional parameters for CID generation
+-record(cid_config, {
+    %% Optional LB config (undefined = use random CIDs)
+    lb_config :: #lb_config{} | undefined,
+    %% Target CID length (1-20 bytes)
+    cid_len = 8 :: 1..20,
+    %% Reset secret for stateless reset token generation
+    reset_secret :: binary() | undefined
+}).
+
 -endif.  % QUIC_HRL
