@@ -740,13 +740,21 @@ handshaking(EventType, EventContent, State) ->
 
 %% ----- CONNECTED STATE -----
 
-connected(enter, handshaking, #state{owner = Owner, conn_ref = Ref, alpn = Alpn} = State) ->
+connected(enter, OldState, #state{owner = Owner, conn_ref = Ref, alpn = Alpn,
+                                   socket = Socket, role = Role} = State)
+  when OldState =:= handshaking; OldState =:= idle ->
     %% Notify owner that connection is established
     Info = #{
         alpn => Alpn,
         alpn_protocol => Alpn
     },
     Owner ! {quic, Ref, {connected, Info}},
+    %% For client connections, ensure socket is active for receiving
+    %% Server connections receive via listener (quic_packet messages)
+    case Role of
+        client -> inet:setopts(Socket, [{active, once}]);
+        server -> ok
+    end,
     {keep_state, State};
 
 connected({call, From}, get_ref, #state{conn_ref = Ref} = State) ->
@@ -1476,7 +1484,17 @@ handle_packet_loop(Data, State) ->
             %% Immediately close the connection
             inet:setopts(State#state.socket, [{active, once}]),
             State#state{close_reason = stateless_reset};
-        {error, _Reason} ->
+        {error, Reason} when Reason =:= padding_only;
+                             Reason =:= empty_packet;
+                             Reason =:= invalid_fixed_bit ->
+            %% End of coalesced packets (padding or invalid trailing data)
+            %% This is normal, just re-enable socket and return
+            inet:setopts(State#state.socket, [{active, once}]),
+            State;
+        {error, Reason} ->
+            %% Log decryption failure for debugging
+            error_logger:warning_msg("[QUIC ~p] Packet decode/decrypt failed: ~p, size=~p~n",
+                                     [State#state.role, Reason, byte_size(Data)]),
             %% Re-enable socket
             inet:setopts(State#state.socket, [{active, once}]),
             State
@@ -1484,12 +1502,27 @@ handle_packet_loop(Data, State) ->
 
 %% Decode and decrypt a packet
 decode_and_decrypt_packet(Data, State) ->
-    %% Check header form (first bit)
+    %% Check header form (first bit) and fixed bit (second bit)
+    %% RFC 9000 Section 17.2/17.3: Fixed bit MUST be 1
     case Data of
+        <<>> ->
+            %% Empty remaining data, nothing to decode
+            {error, empty_packet};
+        <<0:8, _/binary>> ->
+            %% First byte is 0x00 - this is padding (all zeros)
+            %% Skip padding by treating as end of coalesced packets
+            {error, padding_only};
         <<1:1, _:7, _/binary>> ->
+            %% Long header (bit 7 = 1)
             decode_long_header_packet(Data, State);
-        <<0:1, _:7, _/binary>> ->
+        <<0:1, 1:1, _:6, _/binary>> ->
+            %% Short header (bit 7 = 0, fixed bit 6 = 1) - valid
             decode_short_header_packet(Data, State);
+        <<0:1, 0:1, _:6, _/binary>> ->
+            %% Short header form but fixed bit = 0 - invalid, skip as padding
+            error_logger:warning_msg("[QUIC] Invalid short header: fixed bit not set, first byte=~p~n",
+                                     [binary:first(Data)]),
+            {error, invalid_fixed_bit};
         _ ->
             {error, invalid_packet}
     end.
@@ -1514,7 +1547,7 @@ decode_long_header_packet(Data, State) ->
             {error, unsupported_packet_type}
     end.
 
-decode_initial_packet(FullPacket, FirstByte, _DCID, ServerSCID, Rest, State) ->
+decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     #state{initial_keys = {ClientKeys, ServerKeys}, role = Role} = State,
 
     %% Select correct keys based on role:
@@ -1534,10 +1567,14 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, ServerSCID, Rest, State) ->
     HeaderLen = byte_size(FullPacket) - byte_size(Rest4),
     <<Header:HeaderLen/binary, Payload/binary>> = FullPacket,
 
-    %% Update DCID to server's SCID (this becomes our destination for future packets)
-    State1 = case State#state.dcid =:= State#state.original_dcid of
-        true -> State#state{dcid = ServerSCID};  % First packet from server, update DCID
-        false -> State  % Already updated
+    %% Update DCID from peer's SCID (their SCID becomes our DCID)
+    %% - Client: update dcid to server's SCID
+    %% - Server: update dcid to client's SCID
+    State1 = case State#state.dcid of
+        <<>> -> State#state{dcid = PeerSCID};  % First packet, set DCID
+        _ when State#state.dcid =:= State#state.original_dcid ->
+            State#state{dcid = PeerSCID};  % Client updates dcid after first server packet
+        _ -> State  % Already updated
     end,
 
     %% Ensure we have enough data
@@ -1689,7 +1726,7 @@ decode_short_header_packet(Data, State) ->
                 client -> ServerKeys;
                 server -> ClientKeys
             end,
-            %% Short header: first byte + DCID (assume 8 bytes based on our SCID)
+            %% Short header: first byte + DCID (our SCID that peer uses as their DCID)
             %% Short header packets don't have length field, so they consume all remaining data
             DCIDLen = byte_size(State#state.scid),
             <<FirstByte, DCID:DCIDLen/binary, EncryptedPayload/binary>> = Data,
@@ -1724,7 +1761,13 @@ decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) -
 
     %% Select appropriate decryption keys based on key_phase
     {DecryptKeys, State1} = select_decrypt_keys(ReceivedKeyPhase, State),
-    {_, ServerDecryptKeys} = DecryptKeys,
+    %% Select correct key based on role:
+    %% - Server decrypts with ClientKeys (data from client)
+    %% - Client decrypts with ServerKeys (data from server)
+    PeerDecryptKeys = case State1#state.role of
+        server -> element(1, DecryptKeys);  % ClientKeys
+        client -> element(2, DecryptKeys)   % ServerKeys
+    end,
 
     %% Extract PN and decrypt
     UnprotHeaderLen = byte_size(UnprotectedHeader),
@@ -1732,7 +1775,7 @@ decrypt_app_packet_continue(UnprotectedHeader, PNLen, EncryptedPayload, State) -
     AAD = UnprotectedHeader,
     Ciphertext = binary:part(EncryptedPayload, PNLen, byte_size(EncryptedPayload) - PNLen),
 
-    #crypto_keys{key = Key, iv = IV} = ServerDecryptKeys,
+    #crypto_keys{key = Key, iv = IV} = PeerDecryptKeys,
     case quic_aead:decrypt(Key, IV, PN, AAD, Ciphertext) of
         {ok, Plaintext} ->
             case quic_frame:decode_all(Plaintext) of
