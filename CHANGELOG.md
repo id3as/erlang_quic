@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.8.0] - unreleased
+## [0.8.0] - 2026-02-20
 
 ### Added
 - Stream prioritization (RFC 9218): urgency-based scheduling with 8 priority
