@@ -441,16 +441,21 @@ calculate_contiguous(Buffer, Current) ->
     case gb_trees:is_empty(Buffer) of
         true -> Current;
         false ->
-            calculate_contiguous_loop(Buffer, Current)
+            %% Use iteration limit to prevent stack overflow with highly fragmented buffers
+            calculate_contiguous_loop(Buffer, Current, 10000)
     end.
 
-calculate_contiguous_loop(Buffer, Current) ->
+%% Tail-recursive with iteration limit to prevent runaway loops
+calculate_contiguous_loop(_Buffer, Current, 0) ->
+    %% Hit iteration limit - return current position to prevent infinite loop
+    Current;
+calculate_contiguous_loop(Buffer, Current, Remaining) ->
     case gb_trees:lookup(Current, Buffer) of
         {value, Data} ->
             DataSize = byte_size(Data),
             case DataSize of
                 0 -> Current;  % Empty data, stop here
-                _ -> calculate_contiguous_loop(Buffer, Current + DataSize)
+                _ -> calculate_contiguous_loop(Buffer, Current + DataSize, Remaining - 1)
             end;
         none ->
             %% No exact match, return current position

@@ -70,6 +70,8 @@
     %% Connection ID -> Pid mapping
     connections :: ets:tid(),
     tickets_table :: ets:tid(),
+    %% Whether this listener owns the ETS tables (false in pool mode)
+    owns_tables = true :: boolean(),
     %% Stateless reset secret (RFC 9000 Section 10.3)
     reset_secret :: binary(),
     %% Connection handler callback: fun(ConnPid, ConnRef) -> {ok, HandlerPid}
@@ -161,7 +163,7 @@ handle_continue(discover_manager, {Socket, Opts}) ->
     ALPNList = maps:get(alpn, Opts, [<<"h3">>]),
     ConnHandler = maps:get(connection_handler, Opts, undefined),
 
-    {ConnTab, TicketTab} = get_tables(Opts),
+    {ConnTab, TicketTab, OwnsTables} = get_tables(Opts),
 
     %% Get actual port and bound address
     {ok, {_BoundAddr, ActualPort}} = inet:sockname(Socket),
@@ -181,6 +183,7 @@ handle_continue(discover_manager, {Socket, Opts}) ->
         alpn_list = ALPNList,
         connections = ConnTab,
         tickets_table = TicketTab,
+        owns_tables = OwnsTables,
         reset_secret = ResetSecret,
         connection_handler = ConnHandler,
         cid_config = CIDConfig,
@@ -239,7 +242,21 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @doc false
+terminate(_Reason, #listener_state{connections = ConnTab, tickets_table = TicketTab,
+                                   owns_tables = OwnsTables, socket = Socket}) ->
+    %% Close socket
+    catch gen_udp:close(Socket),
+    %% Only delete ETS tables if we own them (standalone mode, not pool mode)
+    case OwnsTables of
+        true ->
+            catch ets:delete(ConnTab),
+            catch ets:delete(TicketTab);
+        false ->
+            ok
+    end,
+    ok;
 terminate(_Reason, _) ->
+    %% Handle case where state is not fully initialized (e.g., init failed early)
     ok.
 
 %% @doc false
@@ -306,15 +323,17 @@ cleanup_connection(Conns, Pid) ->
 %% Use provided ETS table or create new one for connection tracking
 %% When using pool mode, the supervisor is in the options, query it for the
 %% table manager and get the table from it.
+%% Returns {ConnTab, TicketTab, OwnsTable} where OwnsTable indicates if
+%% this listener should delete the tables on terminate.
 get_tables(#{supervisor := SupPid}) ->
     Children = supervisor:which_children(SupPid),
     {quic_listener_manager, ManagerPid, _, _} = lists:keyfind(quic_listener_manager, 1, Children),
     {ok, {ConnTab, TicketTab}} = quic_listener_manager:get_tables(ManagerPid),
-    {ConnTab, TicketTab};
+    {ConnTab, TicketTab, false};  % Pool mode - don't own tables
 get_tables(_) ->
     ConnTab = ets:new(quic_connections, [set, protected]),
-    TicketTab = ets:new(quic_connections, [set, protected]),
-    {ConnTab, TicketTab}.
+    TicketTab = ets:new(quic_tickets, [set, protected]),
+    {ConnTab, TicketTab, true}.   % Standalone mode - own tables
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of

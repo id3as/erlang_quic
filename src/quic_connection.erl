@@ -124,6 +124,9 @@
 -define(TLS_AWAITING_CLIENT_HELLO, awaiting_client_hello).
 -define(TLS_AWAITING_CLIENT_FINISHED, awaiting_client_finished).
 
+%% Max pending data entries before connection is established (prevents memory exhaustion)
+-define(MAX_PENDING_DATA_ENTRIES, 1000).
+
 %% Connection state record
 -record(state, {
     %% Connection identity
@@ -720,6 +723,11 @@ terminate(_Reason, _StateName, #state{socket = Socket, conn_ref = ConnRef,
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
+    %% Cancel delayed ACK timer from process dictionary
+    case erase(ack_timer) of
+        undefined -> ok;
+        AckTimerRef -> cancel_timer(AckTimerRef)
+    end,
     %% Only close socket for client connections (clients own their socket)
     %% Server connections share the listener's socket and must not close it
     case {Role, Socket} of
@@ -774,9 +782,15 @@ idle({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) ->
     end;
 
 %% 0-RTT: Allow sending data in idle state if early keys are available
-idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
-    Pending = State#state.pending_data ++ [{StreamId, Data, Fin}],
-    {keep_state, State#state{pending_data = Pending}, [{reply, From, ok}]};
+idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined,
+                                                            pending_data = Pending} = State) ->
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            {keep_state, State, [{reply, From, {error, pending_data_limit}}]};
+        false ->
+            NewPending = Pending ++ [{StreamId, Data, Fin}],
+            {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
+    end;
 idle({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
     case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
         {ok, NewState} ->
@@ -838,10 +852,16 @@ handshaking({call, From}, open_stream, #state{early_keys = _EarlyKeys} = State) 
     end;
 
 %% 0-RTT: Allow sending data during handshake if early keys are available
-handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined} = State) ->
-    %% No early keys, queue the data for later
-    Pending = State#state.pending_data ++ [{StreamId, Data, Fin}],
-    {keep_state, State#state{pending_data = Pending}, [{reply, From, ok}]};
+handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = undefined,
+                                                                   pending_data = Pending} = State) ->
+    %% No early keys, queue the data for later (with limit to prevent memory exhaustion)
+    case length(Pending) >= ?MAX_PENDING_DATA_ENTRIES of
+        true ->
+            {keep_state, State, [{reply, From, {error, pending_data_limit}}]};
+        false ->
+            NewPending = Pending ++ [{StreamId, Data, Fin}],
+            {keep_state, State#state{pending_data = NewPending}, [{reply, From, ok}]}
+    end;
 handshaking({call, From}, {send_data, StreamId, Data, Fin}, #state{early_keys = _} = State) ->
     %% Send as 0-RTT data
     case do_send_zero_rtt_data(StreamId, Data, Fin, State) of
@@ -1040,10 +1060,15 @@ connected(EventType, EventContent, State) ->
 
 %% ----- DRAINING STATE -----
 
-draining(enter, _OldState, #state{owner = Owner, conn_ref = Ref, close_reason = Reason} = State) ->
+draining(enter, _OldState, #state{owner = Owner, conn_ref = Ref, close_reason = Reason,
+                                  loss_state = LossState} = State) ->
     Owner ! {quic, Ref, {closed, Reason}},
-    %% Start drain timer (3 * PTO)
-    TimerRef = erlang:send_after(3000, self(), drain_timeout),
+    %% Start drain timer (3 * PTO per RFC 9000 Section 10.2)
+    DrainTimeout = case LossState of
+        undefined -> 3000;  % Fallback if loss state not initialized
+        _ -> 3 * quic_loss:get_pto(LossState)
+    end,
+    TimerRef = erlang:send_after(DrainTimeout, self(), drain_timeout),
     {keep_state, State#state{timer_ref = TimerRef}};
 
 draining({call, From}, get_state, State) ->
@@ -1267,16 +1292,57 @@ find_matching_ticket(Identity, [_ | Rest]) ->
 
 %% Global ticket storage using ETS (for 0-RTT across connections)
 -define(TICKET_TABLE, quic_server_tickets).
+%% Ticket TTL: 7 days in milliseconds (RFC 8446 recommends max 7 days)
+-define(TICKET_TTL_MS, 7 * 24 * 60 * 60 * 1000).
+%% Max tickets to store (prevents unbounded memory growth)
+-define(MAX_TICKETS, 10000).
 
 store_ticket_globally(TicketIdentity, Ticket) ->
     ensure_ticket_table(),
-    ets:insert(?TICKET_TABLE, {TicketIdentity, Ticket}).
+    Now = erlang:monotonic_time(millisecond),
+    %% Cleanup expired tickets periodically (1 in 100 chance on insert)
+    case rand:uniform(100) of
+        1 -> cleanup_expired_tickets(Now);
+        _ -> ok
+    end,
+    %% Check table size and evict oldest if needed
+    case ets:info(?TICKET_TABLE, size) >= ?MAX_TICKETS of
+        true -> evict_oldest_ticket();
+        false -> ok
+    end,
+    ets:insert(?TICKET_TABLE, {TicketIdentity, Ticket, Now}).
 
 lookup_ticket_globally(TicketIdentity) ->
     ensure_ticket_table(),
+    Now = erlang:monotonic_time(millisecond),
     case ets:lookup(?TICKET_TABLE, TicketIdentity) of
-        [{_, Ticket}] -> {ok, Ticket};
-        [] -> error
+        [{_, Ticket, StoredAt}] ->
+            case Now - StoredAt > ?TICKET_TTL_MS of
+                true ->
+                    %% Ticket expired, delete it
+                    ets:delete(?TICKET_TABLE, TicketIdentity),
+                    error;
+                false ->
+                    {ok, Ticket}
+            end;
+        [{_, Ticket}] ->
+            %% Legacy entry without timestamp, treat as valid
+            {ok, Ticket};
+        [] ->
+            error
+    end.
+
+cleanup_expired_tickets(Now) ->
+    %% Delete all tickets older than TTL
+    ets:select_delete(?TICKET_TABLE, [
+        {{'_', '_', '$1'}, [{'<', '$1', {const, Now - ?TICKET_TTL_MS}}], [true]}
+    ]).
+
+evict_oldest_ticket() ->
+    %% Find and delete the oldest ticket
+    case ets:first(?TICKET_TABLE) of
+        '$end_of_table' -> ok;
+        Key -> ets:delete(?TICKET_TABLE, Key)
     end.
 
 ensure_ticket_table() ->
@@ -1284,7 +1350,7 @@ ensure_ticket_table() ->
         undefined ->
             %% Create the table - public so all connections can access it
             try
-                ets:new(?TICKET_TABLE, [named_table, public, set, {read_concurrency, true}])
+                ets:new(?TICKET_TABLE, [named_table, public, ordered_set, {read_concurrency, true}])
             catch
                 error:badarg -> ok  % Table already exists (race condition)
             end;

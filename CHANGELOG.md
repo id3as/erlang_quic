@@ -22,6 +22,18 @@ All notable changes to this project will be documented in this file.
 - Server-side connection termination no longer closes shared listener socket:
   previously when a server connection terminated, it would close the UDP socket
   shared with the listener, breaking all subsequent connections
+- Cancel delayed ACK timer in connection terminate to prevent timer messages
+  to dead processes
+- Session ticket table now has TTL (7 days) and size limit (10,000 entries) to
+  prevent unbounded memory growth
+- Listener now properly cleans up ETS tables on terminate (standalone mode only,
+  pool mode tables are managed by the pool manager)
+- Draining state now uses calculated `3 * PTO` timeout per RFC 9000 Section 10.2
+  instead of hardcoded 3 seconds
+- Pre-connection pending data queue now has size limit (1000 entries) to prevent
+  memory exhaustion from slow handshakes
+- Buffer contiguity calculation now has iteration limit to prevent stack overflow
+  with highly fragmented receive buffers
 
 ## [0.9.0] - 2026-02-20
 
