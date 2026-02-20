@@ -3007,6 +3007,7 @@ normalize_alpn_list(_) ->
 
 %% @doc Initiate a key update.
 %% Derives new application secrets and keys, switches to the new key phase.
+%% RFC 9001 Section 6.6: HP keys are NOT rotated during key updates.
 initiate_key_update(#state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
@@ -3015,27 +3016,27 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
         server_app_secret = ServerSecret
     } = KeyState,
 
-    %% Get cipher from current keys
-    {ClientKeys, _} = CurrentKeys,
-    Cipher = ClientKeys#crypto_keys.cipher,
+    %% Get cipher and HP keys from current keys (HP keys don't change)
+    {OldClientKeys, OldServerKeys} = CurrentKeys,
+    Cipher = OldClientKeys#crypto_keys.cipher,
 
     %% Derive new secrets using "quic ku" label
-    {NewClientSecret, {NewClientKey, NewClientIV, NewClientHP}} =
+    {NewClientSecret, {NewClientKey, NewClientIV, _}} =
         quic_keys:derive_updated_keys(ClientSecret, Cipher),
-    {NewServerSecret, {NewServerKey, NewServerIV, NewServerHP}} =
+    {NewServerSecret, {NewServerKey, NewServerIV, _}} =
         quic_keys:derive_updated_keys(ServerSecret, Cipher),
 
-    %% Create new crypto_keys records
+    %% Create new crypto_keys records (preserve HP keys per RFC 9001 Section 6.6)
     NewClientKeys = #crypto_keys{
         key = NewClientKey,
         iv = NewClientIV,
-        hp = NewClientHP,
+        hp = OldClientKeys#crypto_keys.hp,  % HP key unchanged
         cipher = Cipher
     },
     NewServerKeys = #crypto_keys{
         key = NewServerKey,
         iv = NewServerIV,
-        hp = NewServerHP,
+        hp = OldServerKeys#crypto_keys.hp,  % HP key unchanged
         cipher = Cipher
     },
 
@@ -3079,25 +3080,26 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
             State#state{key_state = NewKeyState};
         idle ->
             %% Peer initiated - we need to respond by deriving new keys
-            {ClientKeys, _} = CurrentKeys,
-            Cipher = ClientKeys#crypto_keys.cipher,
+            %% RFC 9001 Section 6.6: HP keys are NOT rotated during key updates
+            {OldClientKeys, OldServerKeys} = CurrentKeys,
+            Cipher = OldClientKeys#crypto_keys.cipher,
 
             %% Derive new secrets
-            {NewClientSecret, {NewClientKey, NewClientIV, NewClientHP}} =
+            {NewClientSecret, {NewClientKey, NewClientIV, _}} =
                 quic_keys:derive_updated_keys(ClientSecret, Cipher),
-            {NewServerSecret, {NewServerKey, NewServerIV, NewServerHP}} =
+            {NewServerSecret, {NewServerKey, NewServerIV, _}} =
                 quic_keys:derive_updated_keys(ServerSecret, Cipher),
 
             NewClientKeys = #crypto_keys{
                 key = NewClientKey,
                 iv = NewClientIV,
-                hp = NewClientHP,
+                hp = OldClientKeys#crypto_keys.hp,  % HP key unchanged
                 cipher = Cipher
             },
             NewServerKeys = #crypto_keys{
                 key = NewServerKey,
                 iv = NewServerIV,
-                hp = NewServerHP,
+                hp = OldServerKeys#crypto_keys.hp,  % HP key unchanged
                 cipher = Cipher
             },
 
