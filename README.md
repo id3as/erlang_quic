@@ -12,6 +12,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - DATAGRAM frame support for unreliable data (RFC 9221)
 - QUIC v2 support (RFC 9369)
 - Server mode with listener and pooled listeners (SO_REUSEPORT)
+- QUIC-LB load balancer support with routable CIDs (RFC 9312)
 - Retry packet handling for address validation (RFC 9000 Section 8.1)
 - Stateless reset support (RFC 9000 Section 10.3)
 - Flow control (connection and stream level)
@@ -143,6 +144,16 @@ The owner process receives messages in the format `{quic, ConnRef, Event}`:
 
 - `quic:send_datagram/2` - Send unreliable datagram
 
+### Load Balancer (RFC 9312)
+
+- `quic_lb:new_config/1` - Create LB configuration from options map
+- `quic_lb:new_cid_config/1` - Create CID generation configuration
+- `quic_lb:generate_cid/1` - Generate a CID with encoded server_id
+- `quic_lb:decode_server_id/2` - Extract server_id from CID
+- `quic_lb:is_lb_routable/1` - Check if CID has valid LB routing bits
+- `quic_lb:get_config_rotation/1` - Get config rotation bits from CID
+- `quic_lb:expected_cid_len/1` - Calculate expected CID length from config
+
 ### Server
 
 - `quic_listener:start_link/2` - Start a QUIC listener
@@ -173,6 +184,7 @@ Ranch-style named server pool management:
 | `alpn` | [binary()] | `[<<"h3">>]` | ALPN protocols to advertise |
 | `pool_size` | pos_integer() | 1 | Number of listener processes (uses SO_REUSEPORT) |
 | `connection_handler` | fun/2 | none | Custom handler: `fun(ConnPid, ConnRef) -> {ok, HandlerPid}` |
+| `lb_config` | map() | none | QUIC-LB configuration for load balancer routing (see below) |
 
 **Server Info Map:**
 
@@ -201,6 +213,67 @@ quic:get_server_connections(my_server).  %% => {ok, [<0.150.0>, <0.151.0>]}
 
 %% Stop server
 quic:stop_server(my_server).
+```
+
+### QUIC-LB Load Balancer Support (RFC 9312)
+
+Enable load balancers to route QUIC packets to the correct server by encoding
+server identity in Connection IDs.
+
+**LB Config Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `server_id` | binary() | required | Server identifier (1-15 bytes) |
+| `algorithm` | atom() | `plaintext` | `plaintext`, `stream_cipher`, or `block_cipher` |
+| `config_rotation` | 0..6 | 0 | Config version for LB coordination |
+| `nonce_len` | 4..18 | 4 | Random nonce length in bytes |
+| `key` | binary() | none | 16-byte AES key (required for cipher algorithms) |
+
+**Example:**
+
+```erlang
+%% Start server with QUIC-LB enabled
+{ok, _} = quic:start_server(my_server, 4433, #{
+    cert => CertDer,
+    key => KeyTerm,
+    alpn => [<<"h3">>],
+    lb_config => #{
+        server_id => <<1, 2, 3, 4>>,      %% Unique ID for this server
+        algorithm => stream_cipher,        %% Encrypt server_id in CID
+        key => crypto:strong_rand_bytes(16)  %% Shared with load balancer
+    }
+}),
+
+%% The server now generates CIDs that encode the server_id
+%% Load balancer can decode server_id to route packets correctly
+```
+
+**Algorithms:**
+
+- `plaintext` - Server ID visible in CID (no encryption, simplest)
+- `stream_cipher` - AES-128-CTR encryption (recommended for most deployments)
+- `block_cipher` - AES-based encryption with Feistel network for variable lengths
+
+**Direct API:**
+
+```erlang
+%% Create LB configuration
+{ok, LBConfig} = quic_lb:new_config(#{
+    server_id => <<1, 2, 3, 4>>,
+    algorithm => stream_cipher,
+    key => Key
+}),
+
+%% Generate a CID
+{ok, CIDConfig} = quic_lb:new_cid_config(#{lb_config => LBConfig}),
+CID = quic_lb:generate_cid(CIDConfig),
+
+%% Decode server_id from CID (used by load balancer)
+{ok, <<1, 2, 3, 4>>} = quic_lb:decode_server_id(CID, LBConfig),
+
+%% Check if CID is LB-routable
+true = quic_lb:is_lb_routable(CID).
 ```
 
 ## Building

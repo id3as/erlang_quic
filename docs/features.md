@@ -85,6 +85,17 @@
 - [x] Updated initial salt
 - [x] Updated retry integrity tag key
 
+## QUIC-LB Load Balancer Support (RFC 9312)
+
+- [x] Server ID encoding in Connection IDs for LB routing
+- [x] Config rotation bits for LB coordination
+- [x] Variable CID length support (1-20 bytes)
+- [x] Three encoding algorithms:
+  - Plaintext: Server ID visible in CID (no encryption)
+  - Stream Cipher: AES-128-CTR encryption
+  - Block Cipher: Feistel network for variable lengths
+- [x] LB-aware CID generation in listener and connection
+
 ## API
 
 ### Connection
@@ -116,6 +127,15 @@
 - `quic:get_server_connections/1` - Get server connection PIDs
 - `quic:which_servers/0` - List all running servers
 
+### Load Balancer (RFC 9312)
+- `quic_lb:new_config/1` - Create LB configuration from options map
+- `quic_lb:new_cid_config/1` - Create CID generation configuration
+- `quic_lb:generate_cid/1` - Generate CID with encoded server_id
+- `quic_lb:decode_server_id/2` - Extract server_id from CID
+- `quic_lb:is_lb_routable/1` - Check if CID has valid LB routing bits
+- `quic_lb:get_config_rotation/1` - Get config rotation bits from CID
+- `quic_lb:expected_cid_len/1` - Calculate expected CID length from config
+
 ### Options
 - `idle_timeout` - Connection idle timeout in milliseconds (0 to disable)
 - `max_data` - Connection-level flow control limit
@@ -126,6 +146,7 @@
 - `preferred_ipv6` - Server preferred IPv6 address
 - `pool_size` - Number of listener processes for server pools (default: 1)
 - `connection_handler` - Callback for handling new connections
+- `lb_config` - QUIC-LB configuration map for load balancer routing
 
 ## Interop Runner Compliance
 
