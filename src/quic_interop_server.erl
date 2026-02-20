@@ -19,6 +19,9 @@
 
 -export([main/1]).
 
+%% Suppress dialyzer warnings for escript functions that call halt()
+-dialyzer({nowarn_function, [main/1, run_server/4]}).
+
 -define(EXIT_SUCCESS, 0).
 -define(EXIT_FAILURE, 1).
 -define(EXIT_UNSUPPORTED, 127).

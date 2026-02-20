@@ -18,6 +18,10 @@
 
 -export([main/1]).
 
+%% Suppress dialyzer warnings for escript functions that call halt()
+-dialyzer({no_return, [main/1, run_test/3]}).
+-dialyzer({nowarn_function, [run_resumption_test/2, run_zerortt_test/2, run_migration_test/2]}).
+
 -define(EXIT_SUCCESS, 0).
 -define(EXIT_FAILURE, 1).
 -define(EXIT_UNSUPPORTED, 127).
@@ -259,18 +263,15 @@ parse_url(Url) ->
         nomatch ->
             error;
         HostPortPath ->
-            case string:split(HostPortPath, "/") of
-                [HostPort | PathParts] ->
-                    Path = "/" ++ string:join(PathParts, "/"),
-                    case string:split(HostPort, ":") of
-                        [Host, PortStr] ->
-                            Port = list_to_integer(PortStr),
-                            {ok, Host, Port, Path};
-                        [Host] ->
-                            {ok, Host, 443, Path}
-                    end;
-                _ ->
-                    error
+            %% string:split always returns at least one element
+            [HostPort | PathParts] = string:split(HostPortPath, "/"),
+            Path = "/" ++ string:join(PathParts, "/"),
+            case string:split(HostPort, ":") of
+                [Host, PortStr] ->
+                    Port = list_to_integer(PortStr),
+                    {ok, Host, Port, Path};
+                [Host] ->
+                    {ok, Host, 443, Path}
             end
     end.
 

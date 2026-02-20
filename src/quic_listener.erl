@@ -36,6 +36,8 @@
 %% Suppress warnings for functions prepared for future use
 -compile([{nowarn_unused_function, [{register_cid, 3}, {unregister_cid, 2}]}]).
 -dialyzer({nowarn_function, [register_cid/3, unregister_cid/2]}).
+%% Suppress pattern warnings for defensive callback handling (user-provided callbacks)
+-dialyzer({no_match, create_connection/4}).
 
 -export([
     start_link/2,
