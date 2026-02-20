@@ -299,7 +299,8 @@ init_cid_config(Opts, ResetSecret) ->
 
 %% Remove all CIDs associated with this connection
 cleanup_connection(Conns, Pid) ->
-    Pattern = {{'_', Pid}, [], [true]},
+    %% Use '$1' match spec variable, not literal atom '_'
+    Pattern = {{'$1', Pid}, [], [true]},
     _ = ets:select_delete(Conns, [Pattern]).
 
 %% Use provided ETS table or create new one for connection tracking

@@ -714,14 +714,17 @@ init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     {ok, idle, State}.
 
 terminate(_Reason, _StateName, #state{socket = Socket, conn_ref = ConnRef,
-                                      pto_timer = PtoTimer, idle_timer = IdleTimer}) ->
+                                      pto_timer = PtoTimer, idle_timer = IdleTimer,
+                                      role = Role}) ->
     unregister_conn(ConnRef),
     %% Cancel any active timers
     cancel_timer(PtoTimer),
     cancel_timer(IdleTimer),
-    case Socket of
-        undefined -> ok;
-        _ -> gen_udp:close(Socket)
+    %% Only close socket for client connections (clients own their socket)
+    %% Server connections share the listener's socket and must not close it
+    case {Role, Socket} of
+        {client, S} when S =/= undefined -> gen_udp:close(S);
+        _ -> ok
     end,
     ok.
 

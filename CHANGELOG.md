@@ -18,6 +18,11 @@ All notable changes to this project will be documented in this file.
 - LB-aware CID generation in `quic_connection` for NEW_CONNECTION_ID frames
 - E2E test suite `quic_lb_e2e_SUITE` with 21 integration tests
 
+### Fixed
+- Server-side connection termination no longer closes shared listener socket:
+  previously when a server connection terminated, it would close the UDP socket
+  shared with the listener, breaking all subsequent connections
+
 ## [0.9.0] - 2026-02-20
 
 ### Added

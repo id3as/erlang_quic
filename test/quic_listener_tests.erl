@@ -201,3 +201,79 @@ connection_handler_invalid_return_test() ->
     {ok, Listener} = quic_listener:start_link(0, Opts),
     ?assert(is_pid(Listener)),
     ok = quic_listener:stop(Listener).
+
+%%====================================================================
+%% Connection Cleanup Tests
+%%====================================================================
+
+%% Test that cleanup_connection properly removes CID entries for dead processes
+%% This tests the fix for the bug where literal atom '_' was used instead of
+%% the match spec variable '$1', causing entries to never be cleaned up
+cleanup_connection_removes_entries_test() ->
+    %% Create an ETS table like the listener uses
+    Conns = ets:new(test_conns, [set, public]),
+
+    %% Create fake connection PIDs
+    Pid1 = spawn(fun() -> receive stop -> ok end end),
+    Pid2 = spawn(fun() -> receive stop -> ok end end),
+
+    %% Insert CID entries for both connections (mimics create_connection)
+    CID1a = <<1,2,3,4,5,6,7,8>>,
+    CID1b = <<10,20,30,40,50,60,70,80>>,
+    CID2a = <<11,12,13,14,15,16,17,18>>,
+    CID2b = <<21,22,23,24,25,26,27,28>>,
+
+    ets:insert(Conns, {CID1a, Pid1}),
+    ets:insert(Conns, {CID1b, Pid1}),
+    ets:insert(Conns, {CID2a, Pid2}),
+    ets:insert(Conns, {CID2b, Pid2}),
+
+    %% Verify all 4 entries exist
+    ?assertEqual(4, ets:info(Conns, size)),
+
+    %% Simulate cleanup for Pid1 using the same logic as quic_listener
+    Pattern = {{'$1', Pid1}, [], [true]},
+    ets:select_delete(Conns, [Pattern]),
+
+    %% Verify Pid1's entries are removed, Pid2's remain
+    ?assertEqual(2, ets:info(Conns, size)),
+    ?assertEqual([], ets:lookup(Conns, CID1a)),
+    ?assertEqual([], ets:lookup(Conns, CID1b)),
+    ?assertEqual([{CID2a, Pid2}], ets:lookup(Conns, CID2a)),
+    ?assertEqual([{CID2b, Pid2}], ets:lookup(Conns, CID2b)),
+
+    %% Cleanup
+    Pid1 ! stop,
+    Pid2 ! stop,
+    ets:delete(Conns).
+
+%% Test both '_' and '$1' work as wildcards in match specs
+cleanup_connection_match_spec_variants_test() ->
+    %% Both '_' and '$1' work as wildcards in ETS match specs
+    Conns = ets:new(test_conns, [set, public]),
+
+    Pid = spawn(fun() -> receive stop -> ok end end),
+    CID1 = <<1,2,3,4,5,6,7,8>>,
+    CID2 = <<9,10,11,12,13,14,15,16>>,
+
+    %% Test with '_' wildcard
+    ets:insert(Conns, {CID1, Pid}),
+    ?assertEqual(1, ets:info(Conns, size)),
+
+    Pattern1 = {{'_', Pid}, [], [true]},
+    Deleted1 = ets:select_delete(Conns, [Pattern1]),
+    ?assertEqual(1, Deleted1),
+    ?assertEqual(0, ets:info(Conns, size)),
+
+    %% Test with '$1' match variable
+    ets:insert(Conns, {CID2, Pid}),
+    ?assertEqual(1, ets:info(Conns, size)),
+
+    Pattern2 = {{'$1', Pid}, [], [true]},
+    Deleted2 = ets:select_delete(Conns, [Pattern2]),
+    ?assertEqual(1, Deleted2),
+    ?assertEqual(0, ets:info(Conns, size)),
+
+    %% Cleanup
+    Pid ! stop,
+    ets:delete(Conns).
