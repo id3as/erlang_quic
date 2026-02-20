@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - unreleased
+
+### Added
+- Stream prioritization (RFC 9218): urgency-based scheduling with 8 priority
+  levels (0-7) and incremental delivery flag
+- `quic:set_stream_priority/4` and `quic:get_stream_priority/2` API
+- Bucket-based priority queue for O(1) stream scheduling
+- Preferred address handling (RFC 9000 Section 9.6): server can advertise a
+  preferred address during handshake, client validates via PATH_CHALLENGE and
+  automatically migrates to validated preferred address
+- `preferred_ipv4` and `preferred_ipv6` listener options for server configuration
+- `#preferred_address{}` record for IPv4/IPv6 addresses, CID, and reset token
+- `quic_tls:encode_preferred_address/1` and `quic_tls:decode_preferred_address/1`
+
 ## [0.7.1] - 2026-02-20
 
 ### Fixed
