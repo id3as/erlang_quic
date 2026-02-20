@@ -47,7 +47,10 @@
     set_owner/2,
     send_datagram/2,
     setopts/2,
-    migrate/1
+    migrate/1,
+    %% Stream prioritization (RFC 9218)
+    set_stream_priority/4,
+    get_stream_priority/2
 ]).
 
 -export([is_available/0, get_fd/1]).
@@ -304,4 +307,38 @@ migrate(ConnRef) when is_reference(ConnRef) ->
 migrate(ConnPid) when is_pid(ConnPid) ->
     quic_connection:migrate(ConnPid);
 migrate(_ConnRef) ->
+    {error, badarg}.
+
+%% @doc Set the priority for a stream.
+%% Urgency: 0-7 (lower = more urgent, default 3)
+%% Incremental: boolean (data can be processed incrementally, default false)
+%% Per RFC 9218 (Extensible Priorities for HTTP).
+-spec set_stream_priority(ConnRef, StreamId, Urgency, Incremental) -> ok | {error, term()}
+    when ConnRef :: reference() | pid(),
+         StreamId :: non_neg_integer(),
+         Urgency :: 0..7,
+         Incremental :: boolean().
+set_stream_priority(ConnRef, StreamId, Urgency, Incremental) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:set_stream_priority(Pid, StreamId, Urgency, Incremental);
+        error -> {error, not_found}
+    end;
+set_stream_priority(ConnPid, StreamId, Urgency, Incremental) when is_pid(ConnPid) ->
+    quic_connection:set_stream_priority(ConnPid, StreamId, Urgency, Incremental);
+set_stream_priority(_ConnRef, _StreamId, _Urgency, _Incremental) ->
+    {error, badarg}.
+
+%% @doc Get the priority for a stream.
+%% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
+-spec get_stream_priority(ConnRef, StreamId) -> {ok, {0..7, boolean()}} | {error, term()}
+    when ConnRef :: reference() | pid(),
+         StreamId :: non_neg_integer().
+get_stream_priority(ConnRef, StreamId) when is_reference(ConnRef) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:get_stream_priority(Pid, StreamId);
+        error -> {error, not_found}
+    end;
+get_stream_priority(ConnPid, StreamId) when is_pid(ConnPid) ->
+    quic_connection:get_stream_priority(ConnPid, StreamId);
+get_stream_priority(_ConnRef, _StreamId) ->
     {error, badarg}.

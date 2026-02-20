@@ -69,7 +69,11 @@
     close/1,
     is_closed/1,
     is_send_closed/1,
-    is_recv_closed/1
+    is_recv_closed/1,
+
+    %% Priority (RFC 9218)
+    get_priority/1,
+    set_priority/3
 ]).
 
 %% Internal stream state record
@@ -97,7 +101,13 @@
 
     %% Error codes (set on RESET_STREAM or STOP_SENDING)
     reset_error :: non_neg_integer() | undefined,
-    stop_error :: non_neg_integer() | undefined
+    stop_error :: non_neg_integer() | undefined,
+
+    %% Stream Priority (RFC 9218)
+    %% Urgency: 0-7 (lower = more urgent, default 3)
+    %% Incremental: boolean (data can be processed incrementally)
+    urgency = 3 :: 0..7,
+    incremental = false :: boolean()
 }).
 
 -opaque stream() :: #stream{}.
@@ -370,6 +380,27 @@ is_send_closed(_) -> false.
 is_recv_closed(#stream{state = half_closed_remote}) -> true;
 is_recv_closed(#stream{state = closed}) -> true;
 is_recv_closed(_) -> false.
+
+%%====================================================================
+%% Priority (RFC 9218)
+%%====================================================================
+
+%% @doc Get the stream priority.
+%% Returns {Urgency, Incremental} where Urgency is 0-7 (lower = more urgent)
+%% and Incremental indicates whether data can be processed incrementally.
+-spec get_priority(stream()) -> {0..7, boolean()}.
+get_priority(#stream{urgency = Urgency, incremental = Incremental}) ->
+    {Urgency, Incremental}.
+
+%% @doc Set the stream priority.
+%% Urgency: 0-7 (lower = more urgent, default 3)
+%% Incremental: boolean (data can be processed incrementally, default false)
+%% Returns {ok, UpdatedStream} or {error, invalid_urgency}.
+-spec set_priority(stream(), 0..7, boolean()) -> {ok, stream()} | {error, invalid_urgency}.
+set_priority(Stream, Urgency, Incremental) when Urgency >= 0, Urgency =< 7, is_boolean(Incremental) ->
+    {ok, Stream#stream{urgency = Urgency, incremental = Incremental}};
+set_priority(_Stream, _Urgency, _Incremental) ->
+    {error, invalid_urgency}.
 
 %%====================================================================
 %% Internal Functions

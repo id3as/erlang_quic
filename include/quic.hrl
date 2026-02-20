@@ -373,7 +373,13 @@
     recv_buffer :: binary(),
 
     %% Final size (set when FIN received)
-    final_size :: non_neg_integer() | undefined
+    final_size :: non_neg_integer() | undefined,
+
+    %% Stream Priority (RFC 9218)
+    %% Urgency: 0-7 (lower = more urgent, default 3)
+    %% Incremental: boolean (data can be processed incrementally)
+    urgency = 3 :: 0..7,
+    incremental = false :: boolean()
 }).
 
 %% Sent packet info for loss detection

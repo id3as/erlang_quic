@@ -276,3 +276,38 @@ receive_fin_only_test() ->
     Stream = quic_stream:new(0, server),
     {ok, S1} = quic_stream:receive_fin(Stream, 0),
     ?assert(quic_stream:is_recv_closed(S1)).
+
+%%====================================================================
+%% Stream Priority Tests (RFC 9218)
+%%====================================================================
+
+default_priority_test() ->
+    Stream = quic_stream:new(0, client),
+    ?assertEqual({3, false}, quic_stream:get_priority(Stream)).
+
+set_priority_test() ->
+    Stream = quic_stream:new(0, client),
+    {ok, S1} = quic_stream:set_priority(Stream, 0, true),
+    ?assertEqual({0, true}, quic_stream:get_priority(S1)).
+
+set_priority_all_levels_test() ->
+    Stream = quic_stream:new(0, client),
+    %% Test all urgency levels 0-7
+    lists:foreach(fun(Urgency) ->
+        {ok, S} = quic_stream:set_priority(Stream, Urgency, false),
+        ?assertEqual({Urgency, false}, quic_stream:get_priority(S))
+    end, lists:seq(0, 7)).
+
+set_priority_incremental_test() ->
+    Stream = quic_stream:new(0, client),
+    {ok, S1} = quic_stream:set_priority(Stream, 3, true),
+    ?assertEqual({3, true}, quic_stream:get_priority(S1)),
+    {ok, S2} = quic_stream:set_priority(S1, 3, false),
+    ?assertEqual({3, false}, quic_stream:get_priority(S2)).
+
+set_priority_invalid_urgency_test() ->
+    Stream = quic_stream:new(0, client),
+    ?assertEqual({error, invalid_urgency},
+                 quic_stream:set_priority(Stream, 8, false)),
+    ?assertEqual({error, invalid_urgency},
+                 quic_stream:set_priority(Stream, -1, false)).

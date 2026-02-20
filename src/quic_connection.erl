@@ -87,7 +87,10 @@
     %% Connection migration (RFC 9000 Section 9)
     migrate/1,
     %% Server mode
-    start_server/1
+    start_server/1,
+    %% Stream prioritization (RFC 9218)
+    set_stream_priority/4,
+    get_stream_priority/2
 ]).
 
 %% gen_statem callbacks
@@ -433,6 +436,21 @@ key_update(Conn) ->
 -spec migrate(pid()) -> ok | {error, term()}.
 migrate(Conn) ->
     gen_statem:call(Conn, migrate).
+
+%% @doc Set stream priority (RFC 9218).
+%% Urgency: 0-7 (lower = more urgent, default 3)
+%% Incremental: boolean (data can be processed incrementally)
+-spec set_stream_priority(pid(), non_neg_integer(), 0..7, boolean()) ->
+    ok | {error, term()}.
+set_stream_priority(Conn, StreamId, Urgency, Incremental) ->
+    gen_statem:call(Conn, {set_stream_priority, StreamId, Urgency, Incremental}).
+
+%% @doc Get stream priority (RFC 9218).
+%% Returns {ok, {Urgency, Incremental}} or {error, not_found}.
+-spec get_stream_priority(pid(), non_neg_integer()) ->
+    {ok, {0..7, boolean()}} | {error, term()}.
+get_stream_priority(Conn, StreamId) ->
+    gen_statem:call(Conn, {get_stream_priority, StreamId}).
 
 %%====================================================================
 %% gen_statem callbacks
@@ -873,6 +891,23 @@ connected({call, From}, {close_stream, StreamId, ErrorCode}, State) ->
     case do_close_stream(StreamId, ErrorCode, State) of
         {ok, NewState} ->
             {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
+%% Stream prioritization (RFC 9218)
+connected({call, From}, {set_stream_priority, StreamId, Urgency, Incremental}, State) ->
+    case do_set_stream_priority(StreamId, Urgency, Incremental, State) of
+        {ok, NewState} ->
+            {keep_state, NewState, [{reply, From, ok}]};
+        {error, Reason} ->
+            {keep_state, State, [{reply, From, {error, Reason}}]}
+    end;
+
+connected({call, From}, {get_stream_priority, StreamId}, State) ->
+    case do_get_stream_priority(StreamId, State) of
+        {ok, Priority} ->
+            {keep_state, State, [{reply, From, {ok, Priority}}]};
         {error, Reason} ->
             {keep_state, State, [{reply, From, {error, Reason}}]}
     end;
@@ -3149,22 +3184,58 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
     end.
 
 %% Queue stream data when congestion window is full
-queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = Queue} = State) ->
-    QueueEntry = {stream_data, StreamId, Offset, Data, Fin},
+%% Includes stream urgency for priority-based scheduling (RFC 9218)
+queue_stream_data(StreamId, Offset, Data, Fin, #state{send_queue = Queue, streams = Streams} = State) ->
+    Urgency = get_stream_urgency(StreamId, Streams),
+    QueueEntry = {stream_data, StreamId, Offset, Data, Fin, Urgency},
     State#state{send_queue = Queue ++ [QueueEntry]}.
 
+%% Get stream urgency (default 3 if stream not found)
+get_stream_urgency(StreamId, Streams) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{urgency = Urgency}} -> Urgency;
+        error -> 3  % Default urgency
+    end.
+
 %% Process send queue when congestion window frees up
+%% Processes streams in priority order (lower urgency = higher priority)
 process_send_queue(#state{send_queue = []} = State) ->
     State;
-process_send_queue(#state{send_queue = [{stream_data, StreamId, Offset, Data, Fin} | Rest]} = State) ->
+process_send_queue(#state{send_queue = Queue} = State) ->
+    %% Sort queue by urgency (lower = more urgent = processed first)
+    SortedQueue = lists:sort(fun compare_queue_priority/2, Queue),
+    process_sorted_queue(State#state{send_queue = SortedQueue}).
+
+%% Compare queue entries by priority (for sorting)
+compare_queue_priority({stream_data, _, _, _, _, Urgency1},
+                       {stream_data, _, _, _, _, Urgency2}) ->
+    Urgency1 =< Urgency2;
+%% Handle legacy entries without urgency (treat as default priority 3)
+compare_queue_priority({stream_data, _, _, _, _}, _) ->
+    true;
+compare_queue_priority(_, {stream_data, _, _, _, _}) ->
+    false.
+
+%% Process the sorted queue
+process_sorted_queue(#state{send_queue = []} = State) ->
+    State;
+process_sorted_queue(#state{send_queue = [Entry | Rest]} = State) ->
+    %% Extract entry (handle both with and without urgency for compatibility)
+    {StreamId, Offset, Data, Fin} = extract_queue_entry(Entry),
     %% Try to send the queued data
     State1 = State#state{send_queue = Rest},
     State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
     %% If data was queued again (cwnd still full), stop processing
     case State2#state.send_queue of
         [_ | _] -> State2;  % Queue has items, stop for now
-        [] -> process_send_queue(State2)  % Keep processing
+        [] -> process_sorted_queue(State2)  % Keep processing
     end.
+
+%% Extract stream data from queue entry (handles both formats for compatibility)
+extract_queue_entry({stream_data, StreamId, Offset, Data, Fin, _Urgency}) ->
+    {StreamId, Offset, Data, Fin};
+extract_queue_entry({stream_data, StreamId, Offset, Data, Fin}) ->
+    {StreamId, Offset, Data, Fin}.
 
 %% Close a stream
 do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
@@ -3177,6 +3248,34 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             {ok, NewState#state{
                 streams = maps:remove(StreamId, Streams)
             }};
+        error ->
+            {error, unknown_stream}
+    end.
+
+%% Set stream priority (RFC 9218)
+do_set_stream_priority(StreamId, Urgency, Incremental, #state{streams = Streams} = State)
+  when Urgency >= 0, Urgency =< 7, is_boolean(Incremental) ->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            NewStreamState = StreamState#stream_state{
+                urgency = Urgency,
+                incremental = Incremental
+            },
+            {ok, State#state{
+                streams = maps:put(StreamId, NewStreamState, Streams)
+            }};
+        error ->
+            {error, unknown_stream}
+    end;
+do_set_stream_priority(_StreamId, _Urgency, _Incremental, _State) ->
+    {error, invalid_priority}.
+
+%% Get stream priority (RFC 9218)
+do_get_stream_priority(StreamId, #state{streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, StreamState} ->
+            {ok, {StreamState#stream_state.urgency,
+                  StreamState#stream_state.incremental}};
         error ->
             {error, unknown_stream}
     end.
