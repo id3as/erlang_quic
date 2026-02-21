@@ -109,6 +109,16 @@
     closed/3
 ]).
 
+%% Test exports
+-ifdef(TEST).
+-export([
+    add_to_ack_ranges/2,
+    merge_ack_ranges/1,
+    convert_ack_ranges_for_encode/1,
+    convert_rest_ranges/2
+]).
+-endif.
+
 %% Registry table name
 -define(REGISTRY, quic_connection_registry).
 
@@ -1702,7 +1712,14 @@ convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
     Gap = PrevStart - End - 2,
     %% Range = End - Start (number of packets in this block)
     Range = End - Start,
-    [{Gap, Range} | convert_rest_ranges(Start, Rest)].
+    %% Validate: Gap and Range must be non-negative for valid ACK ranges
+    case Gap >= 0 andalso Range >= 0 of
+        true ->
+            [{Gap, Range} | convert_rest_ranges(Start, Rest)];
+        false ->
+            %% Skip malformed range (defensive - shouldn't happen with proper range tracking)
+            convert_rest_ranges(Start, Rest)
+    end.
 
 %% Send a Handshake packet
 send_handshake_packet(Payload, State) ->
@@ -3230,20 +3247,40 @@ update_pn_space_recv(PN, PNSpace) ->
         L when PN > L -> PN;
         L -> L
     end,
-    %% Add to ack_ranges (simple: just track largest for now)
-    %% A complete implementation would maintain ACK ranges
-    NewRanges = case Ranges of
-        [] -> [{PN, PN}];
-        [{Start, End} | Rest] when PN =:= End + 1 ->
-            [{Start, PN} | Rest];
-        _ ->
-            [{PN, PN} | Ranges]
-    end,
+    %% Add to ack_ranges maintaining descending order and merging adjacent ranges
+    NewRanges = add_to_ack_ranges(PN, Ranges),
     PNSpace#pn_space{
         largest_recv = NewLargest,
         recv_time = erlang:monotonic_time(millisecond),
         ack_ranges = NewRanges
     }.
+
+%% Add a packet number to ACK ranges, maintaining descending order by Start
+%% and merging adjacent/overlapping ranges
+add_to_ack_ranges(PN, []) ->
+    [{PN, PN}];
+add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN > End + 1 ->
+    %% PN is above this range with a gap - insert new range before
+    [{PN, PN}, {Start, End} | Rest];
+add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN =:= End + 1 ->
+    %% PN extends this range upward
+    [{Start, PN} | Rest];
+add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN >= Start, PN =< End ->
+    %% PN already in this range (duplicate packet)
+    [{Start, End} | Rest];
+add_to_ack_ranges(PN, [{Start, End} | Rest]) when PN =:= Start - 1 ->
+    %% PN extends this range downward - may need to merge with next range
+    merge_ack_ranges([{PN, End} | Rest]);
+add_to_ack_ranges(PN, [Range | Rest]) ->
+    %% PN belongs somewhere in Rest
+    [Range | add_to_ack_ranges(PN, Rest)].
+
+%% Merge adjacent ranges after extending downward
+merge_ack_ranges([{S1, E1}, {S2, E2} | Rest]) when E2 + 1 >= S1 ->
+    %% Ranges overlap or are adjacent, merge them
+    merge_ack_ranges([{S2, max(E1, E2)} | Rest]);
+merge_ack_ranges(Ranges) ->
+    Ranges.
 
 %% Update last activity timestamp and reset idle timer
 update_last_activity(State) ->
