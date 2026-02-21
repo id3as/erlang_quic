@@ -429,10 +429,8 @@ create_connection(Packet, DCID, RemoteAddr,
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of
         {ok, ConnPid} ->
             %% Get connection reference
+            %% Note: ConnPid is already linked via start_link in start_server/1
             ConnRef = gen_statem:call(ConnPid, get_ref),
-
-            %% Link to monitor connection
-            link(ConnPid),
 
             %% Register connection ID
             ets:insert(Conns, {DCID, ConnPid}),
