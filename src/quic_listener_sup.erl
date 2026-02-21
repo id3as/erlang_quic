@@ -85,8 +85,8 @@ init({Port, Opts}) ->
         undefined ->
             ok;
         Name when is_atom(Name) ->
-            %% Use catch in case registry isn't started (standalone listener_sup usage)
-            catch quic_server_registry:register(Name, Self, Port, Opts)
+            %% Ignore errors in case registry isn't started (standalone listener_sup usage)
+            try quic_server_registry:register(Name, Self, Port, Opts) catch _:_ -> ok end
     end,
 
     SupFlags = #{strategy => rest_for_one, intensity => 10, period => 5},

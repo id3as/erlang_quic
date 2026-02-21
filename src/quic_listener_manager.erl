@@ -33,13 +33,13 @@ init(noargs) ->
     TicketTab = ets:new(quic_server_tickets, Opts),
     {ok, {ConnTab, TicketTab}}.
 
--spec handle_call(dynamic(), gen_server:from(), state()) ->
+-spec handle_call(term(), gen_server:from(), state()) ->
     {reply, {ok, state()} | not_implemented, state()}.
 handle_call(get_tables, _From, Tabs) ->
     {reply, {ok, Tabs}, Tabs};
 handle_call(_Request, _From, Tabs) ->
     {reply, not_implemented, Tabs}.
 
--spec handle_cast(dynamic(), state()) -> {noreply, state()}.
+-spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Msg, Tabs) ->
     {noreply, Tabs}.

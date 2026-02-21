@@ -169,7 +169,7 @@ path_challenge_response_match_test() ->
 path_challenge_response_mismatch_test() ->
     ChallengeData = <<1,2,3,4,5,6,7,8>>,
     ResponseData = <<8,7,6,5,4,3,2,1>>,
-    ?assertNotEqual(ChallengeData, ResponseData).
+    ?assert(ChallengeData /= ResponseData).
 
 %%====================================================================
 %% Path Validation State Machine Tests
@@ -224,7 +224,7 @@ path_validation_failure_test() ->
 
     %% Mismatched response doesn't validate
     WrongResponse = <<8,7,6,5,4,3,2,1>>,
-    ?assertNotEqual(Path#path_state.challenge_data, WrongResponse).
+    ?assert(Path#path_state.challenge_data /= WrongResponse).
 
 %%====================================================================
 %% Helper Functions

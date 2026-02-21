@@ -297,7 +297,7 @@ register_conn(ConnRef, Pid) ->
 %% @doc Unregister a connection reference.
 -spec unregister_conn(reference()) -> ok.
 unregister_conn(ConnRef) ->
-    catch ets:delete(?REGISTRY, ConnRef),
+    (try ets:delete(?REGISTRY, ConnRef) catch _:_ -> ok end),
     ok.
 
 %% @doc Lookup a connection pid by reference.

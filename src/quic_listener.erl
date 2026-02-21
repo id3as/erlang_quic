@@ -129,7 +129,7 @@ get_connections(Listener) ->
 %%====================================================================
 
 %% @doc false
--spec init({inet:port_number(), map()}) -> dynamic().
+-spec init({inet:port_number(), map()}) -> term().
 init({Port, Opts}) ->
     process_flag(trap_exit, true),
 
@@ -193,7 +193,7 @@ handle_continue(discover_manager, {Socket, Opts}) ->
     {noreply, State}.
 
 %% @doc false
--spec handle_call(dynamic(), gen_server:from(), state()) -> {reply, dynamic(), state()}.
+-spec handle_call(term(), gen_server:from(), state()) -> {reply, term(), state()}.
 handle_call(get_port, _From, #listener_state{port = Port} = State) ->
     {reply, Port, State};
 
@@ -244,13 +244,12 @@ handle_info(_Info, State) ->
 %% @doc false
 terminate(_Reason, #listener_state{connections = ConnTab, tickets_table = TicketTab,
                                    owns_tables = OwnsTables, socket = Socket}) ->
-    %% Close socket
-    catch gen_udp:close(Socket),
+    safe_close_socket(Socket),
     %% Only delete ETS tables if we own them (standalone mode, not pool mode)
     case OwnsTables of
         true ->
-            catch ets:delete(ConnTab),
-            catch ets:delete(TicketTab);
+            safe_delete_table(ConnTab),
+            safe_delete_table(TicketTab);
         false ->
             ok
     end,
@@ -266,6 +265,12 @@ code_change(_OldVsn, State, _Extra) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+safe_close_socket(Socket) ->
+    try gen_udp:close(Socket) catch _:_ -> ok end.
+
+safe_delete_table(Tab) ->
+    try ets:delete(Tab) catch _:_ -> ok end.
 
 %% Initialize QUIC-LB CID configuration from options
 %% Returns {CIDConfig | undefined, DCIDLen}
