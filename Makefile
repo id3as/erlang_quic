@@ -10,4 +10,11 @@ LOCAL_DEPS = crypto ssl public_key
 
 # Standard targets.
 
+ifndef ERLANG_MK_FILENAME
+ERLANG_MK_VERSION = 2024.07.02
+
+erlang.mk:
+	curl -o $@ https://raw.githubusercontent.com/ninenines/erlang.mk/v$(ERLANG_MK_VERSION)/erlang.mk
+endif
+
 include $(if $(ERLANG_MK_FILENAME),$(ERLANG_MK_FILENAME),erlang.mk)
