@@ -210,7 +210,7 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
 %% @doc false
--spec handle_cast(dynamic(), state()) -> {noreply, state()}.
+-spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
