@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.2] - 2026-02-21
+
+### Fixed
+- Deprecated `catch` expressions replaced with `try...catch...end`
+- Undefined `dynamic()` type replaced with `term()` in type specs
+- CI workflow consolidated with separate unit-tests, e2e, and interop jobs
+
 ## [0.10.1] - 2026-02-21
 
 ### Fixed
