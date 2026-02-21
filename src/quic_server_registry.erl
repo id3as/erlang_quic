@@ -35,6 +35,7 @@
     lookup/1,
     list/0,
     get_port/1,
+    update_port/2,
     get_connections/1
 ]).
 
@@ -86,11 +87,37 @@ list() ->
     ets:select(?TABLE, [{{'$1', '_'}, [], ['$1']}]).
 
 %% @doc Get the port for a named server.
+%% If the server was started with port 0, queries the actual bound port from a listener
+%% and updates the registry for future lookups.
 -spec get_port(atom()) -> {ok, inet:port_number()} | {error, not_found}.
 get_port(Name) ->
     case lookup(Name) of
-        {ok, #{port := Port}} -> {ok, Port};
-        {error, not_found} -> {error, not_found}
+        {ok, #{port := 0, pid := Pid}} ->
+            %% Port 0 means ephemeral - need to query actual listener
+            case get_actual_port_from_listener(Pid) of
+                {ok, ActualPort} ->
+                    %% Update registry for future lookups
+                    ok = update_port(Name, ActualPort),
+                    {ok, ActualPort};
+                Error ->
+                    Error
+            end;
+        {ok, #{port := Port}} ->
+            {ok, Port};
+        {error, not_found} ->
+            {error, not_found}
+    end.
+
+%% @doc Update the port for a named server.
+%% Used when a server was started with port 0 and we've discovered the actual port.
+-spec update_port(atom(), inet:port_number()) -> ok | {error, not_found}.
+update_port(Name, Port) when is_atom(Name), is_integer(Port), Port > 0, Port =< 65535 ->
+    case ets:lookup(?TABLE, Name) of
+        [{Name, Info}] ->
+            true = ets:insert(?TABLE, {Name, Info#{port => Port}}),
+            ok;
+        [] ->
+            {error, not_found}
     end.
 
 %% @doc Get the connection PIDs for a named server.
@@ -205,3 +232,28 @@ find_monitor_by_pid(Pid, Monitors) ->
         undefined,
         Monitors
     ).
+
+%% @doc Get actual bound port from a listener when server was started with port 0.
+%% Navigates the supervision tree: listener_sup -> listener_sup_sup -> quic_listener
+get_actual_port_from_listener(ListenerSupPid) ->
+    try
+        %% Get children of listener_sup - includes quic_listener_sup_sup
+        Children = supervisor:which_children(ListenerSupPid),
+        %% Find the listener_sup_sup
+        case lists:keyfind(quic_listener_sup_sup, 1, Children) of
+            {quic_listener_sup_sup, SupSupPid, _, _} when is_pid(SupSupPid) ->
+                %% Get listeners from sup_sup
+                ListenerChildren = supervisor:which_children(SupSupPid),
+                case [P || {{quic_listener, _}, P, _, _} <- ListenerChildren, is_pid(P)] of
+                    [ListenerPid | _] ->
+                        {ok, quic_listener:get_port(ListenerPid)};
+                    [] ->
+                        {error, no_listeners}
+                end;
+            _ ->
+                {error, no_listener_sup}
+        end
+    catch
+        _:_ ->
+            {error, failed_to_get_port}
+    end.

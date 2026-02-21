@@ -185,11 +185,15 @@ which_servers_test() ->
 get_server_port_test() ->
     {ok, _} = quic:start_server(port_server, 0, base_opts()),
 
-    %% Port 0 is stored as 0 in registry (actual port assigned by OS to socket)
+    %% Port 0 means ephemeral - should return actual OS-assigned port (> 0)
     {ok, Port} = quic:get_server_port(port_server),
     ?assert(is_integer(Port)),
-    ?assert(Port >= 0),
-    ?assert(Port < 65536).
+    ?assert(Port > 0),  %% Ephemeral ports are never 0
+    ?assert(Port < 65536),
+
+    %% Second call should also return the same port (cached in registry)
+    {ok, Port2} = quic:get_server_port(port_server),
+    ?assertEqual(Port, Port2).
 
 badarg_test() ->
     %% Invalid name

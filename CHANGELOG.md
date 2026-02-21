@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
   supervision trees
 
 ### Fixed
+- `quic:get_server_port/1` now returns the actual OS-assigned port when server
+  was started with port 0 (ephemeral port), instead of returning 0
 - Server-side connection termination no longer closes shared listener socket:
   previously when a server connection terminated, it would close the UDP socket
   shared with the listener, breaking all subsequent connections
