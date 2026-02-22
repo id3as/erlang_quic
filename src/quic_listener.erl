@@ -342,13 +342,18 @@ get_tables(_) ->
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
         {initial, DCID, _SCID, Version, _Rest} ->
+            error_logger:info_msg("[QUIC listener] Initial packet from ~p, DCID=~p, Version=~.16B~n",
+                                  [RemoteAddr, DCID, Version]),
             handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
         {short, DCID, _Rest} ->
+            error_logger:info_msg("[QUIC listener] Short header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
-        {long, DCID, _SCID, _PacketType, _Rest} ->
+        {long, DCID, _SCID, PacketType, _Rest} ->
+            error_logger:info_msg("[QUIC listener] Long header packet type=~p, DCID=~p~n",
+                                  [PacketType, DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
-        {error, _Reason} ->
-            %% Drop malformed packets
+        {error, Reason} ->
+            error_logger:warning_msg("[QUIC listener] Failed to parse packet: ~p~n", [Reason]),
             ok
     end.
 
