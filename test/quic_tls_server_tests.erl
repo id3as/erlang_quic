@@ -150,3 +150,56 @@ server_hello_roundtrip_test() ->
     %% Check that we got a 32-byte public key
     ParsedPubKey = maps:get(public_key, Parsed),
     ?assertEqual(32, byte_size(ParsedPubKey)).
+
+%%====================================================================
+%% RFC 9000 Section 7.3 - Transport Parameter Compliance Tests
+%%====================================================================
+
+%% RFC 9000 §7.3: Server MUST include original_dcid in transport params
+%% This echoes the DCID from the client's Initial packet
+build_encrypted_extensions_with_original_dcid_test() ->
+    OriginalDCID = crypto:strong_rand_bytes(8),
+    SCID = crypto:strong_rand_bytes(8),
+
+    EncExt = quic_tls:build_encrypted_extensions(#{
+        alpn => <<"h3">>,
+        transport_params => #{
+            original_dcid => OriginalDCID,
+            initial_scid => SCID,
+            initial_max_data => 1000000
+        }
+    }),
+
+    <<Type, _/binary>> = EncExt,
+    ?assertEqual(?TLS_ENCRYPTED_EXTENSIONS, Type).
+
+%% Verify original_dcid roundtrip through transport params encoding
+original_dcid_roundtrip_test() ->
+    OriginalDCID = crypto:strong_rand_bytes(8),
+    SCID = crypto:strong_rand_bytes(8),
+
+    Params = #{
+        original_dcid => OriginalDCID,
+        initial_scid => SCID,
+        initial_max_data => 1000000
+    },
+
+    Encoded = quic_tls:encode_transport_params(Params),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+
+    %% Verify original_dcid was preserved
+    ?assertEqual(OriginalDCID, maps:get(original_dcid, Decoded)),
+    ?assertEqual(SCID, maps:get(initial_scid, Decoded)).
+
+%% Verify initial_scid is the correct key (not "scid")
+%% This test ensures quic_tls decodes the transport param as initial_scid
+initial_scid_key_name_test() ->
+    SCID = crypto:strong_rand_bytes(8),
+    Params = #{initial_scid => SCID},
+
+    Encoded = quic_tls:encode_transport_params(Params),
+    {ok, Decoded} = quic_tls:decode_transport_params(Encoded),
+
+    %% Must use initial_scid, not scid
+    ?assertEqual(SCID, maps:get(initial_scid, Decoded)),
+    ?assertEqual(undefined, maps:get(scid, Decoded, undefined)).
