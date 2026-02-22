@@ -438,8 +438,10 @@ create_connection(Packet, DCID, Version, RemoteAddr,
         version => Version
     },
 
+    error_logger:info_msg("[QUIC listener] Creating connection for DCID=~p~n", [DCID]),
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of
         {ok, ConnPid} ->
+            error_logger:info_msg("[QUIC listener] Connection created: ~p~n", [ConnPid]),
             %% Get connection reference
             %% Note: ConnPid is already linked via start_link in start_server/1
             ConnRef = gen_statem:call(ConnPid, get_ref),
@@ -481,6 +483,7 @@ create_connection(Packet, DCID, Version, RemoteAddr,
 
             {ok, ConnPid};
         {error, Reason} ->
+            error_logger:warning_msg("[QUIC listener] Failed to start connection: ~p~n", [Reason]),
             {error, Reason}
     end.
 
