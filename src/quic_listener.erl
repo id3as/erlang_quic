@@ -215,6 +215,8 @@ handle_cast(_Msg, State) ->
 %% Handle incoming UDP packets
 handle_info({udp, Socket, SrcIP, SrcPort, Packet},
             #listener_state{socket = Socket} = State) ->
+    error_logger:info_msg("[QUIC listener] Received UDP packet from ~p:~p, size=~p~n",
+                          [SrcIP, SrcPort, byte_size(Packet)]),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
 
