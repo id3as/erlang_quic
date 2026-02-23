@@ -1259,9 +1259,13 @@ send_client_hello(State) ->
     NewState.
 
 %% Server: Select cipher suite from client's list (server preference)
+%% ClientCipherSuites is a list of TLS cipher suite codes (integers)
+%% Convert to atoms for internal use
 select_cipher(ClientCipherSuites) ->
+    %% Convert client's cipher suite codes to atoms
+    ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
     ServerPreference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
-    select_first_match(ServerPreference, ClientCipherSuites).
+    select_first_match(ServerPreference, ClientCiphers).
 
 select_first_match([], _) -> aes_128_gcm;  % Default
 select_first_match([Cipher | Rest], ClientSuites) ->
@@ -1269,6 +1273,12 @@ select_first_match([Cipher | Rest], ClientSuites) ->
         true -> Cipher;
         false -> select_first_match(Rest, ClientSuites)
     end.
+
+%% Convert TLS cipher suite code to internal atom
+cipher_code_to_atom(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
+cipher_code_to_atom(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
+cipher_code_to_atom(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
+cipher_code_to_atom(_) -> unknown.
 
 %% Server: Negotiate ALPN
 negotiate_alpn(ClientALPN, ServerALPN) ->
@@ -1443,6 +1453,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     AllCerts = [Cert | CertChain],
     CertMsg = quic_tls:build_certificate(<<>>, AllCerts),
 
+    error_logger:info_msg("[QUIC] TLS msg sizes: EncExt=~p, Cert=~p~n",
+                          [byte_size(EncExtMsg), byte_size(CertMsg)]),
     %% Update transcript after EncryptedExtensions and Certificate
     Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertMsg/binary>>,
     TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
@@ -1450,6 +1462,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% Build CertificateVerify - select signature algorithm based on key type
     SigAlg = select_signature_algorithm(PrivateKey),
     CertVerifyMsg = quic_tls:build_certificate_verify(SigAlg, PrivateKey, TranscriptHashForCV),
+    error_logger:info_msg("[QUIC] TLS msg sizes: CertVerify=~p~n",
+                          [byte_size(CertVerifyMsg)]),
 
     %% Update transcript after CertificateVerify
     Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
@@ -1459,25 +1473,44 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     ServerFinishedKey = quic_crypto:derive_finished_key(Cipher, ServerHsSecret),
     ServerVerifyData = quic_crypto:compute_finished_verify(Cipher, ServerFinishedKey, TranscriptHashForFinished),
     FinishedMsg = quic_tls:build_finished(ServerVerifyData),
+    error_logger:info_msg("[QUIC] TLS msg sizes: Finished=~p~n",
+                          [byte_size(FinishedMsg)]),
 
     %% Update transcript after server Finished
     Transcript3 = <<Transcript2/binary, FinishedMsg/binary>>,
     TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript3),
 
-    error_logger:info_msg("[QUIC] App key derivation: transcript_size=~p, transcript_hash_prefix=~p~n",
-                          [byte_size(Transcript3), binary:part(TranscriptHashFinal, 0, 8)]),
+    error_logger:info_msg("[QUIC] Server Finished: verify_data=~p~n",
+                          [binary:encode_hex(ServerVerifyData)]),
+    error_logger:info_msg("[QUIC] Server Finished msg (full): ~p~n",
+                          [binary:encode_hex(FinishedMsg)]),
+    error_logger:info_msg("[QUIC] App key derivation: cipher=~p, transcript_size=~p~n",
+                          [Cipher, byte_size(Transcript3)]),
+    error_logger:info_msg("[QUIC] TranscriptHashFinal=~p~n",
+                          [binary:encode_hex(TranscriptHashFinal)]),
+    error_logger:info_msg("[QUIC] HandshakeSecret=~p~n",
+                          [binary:encode_hex(HandshakeSecret)]),
 
     %% Derive master secret and application keys
     MasterSecret = quic_crypto:derive_master_secret(Cipher, HandshakeSecret),
+    error_logger:info_msg("[QUIC] MasterSecret=~p~n",
+                          [binary:encode_hex(MasterSecret)]),
+
     ClientAppSecret = quic_crypto:derive_client_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
     ServerAppSecret = quic_crypto:derive_server_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
+    error_logger:info_msg("[QUIC] ClientAppSecret=~p~n",
+                          [binary:encode_hex(ClientAppSecret)]),
+    error_logger:info_msg("[QUIC] ServerAppSecret=~p~n",
+                          [binary:encode_hex(ServerAppSecret)]),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
 
-    error_logger:info_msg("[QUIC] Derived app keys: ServerKey_prefix=~p, ClientKey_prefix=~p~n",
-                          [binary:part(ServerKey, 0, 4), binary:part(ClientKey, 0, 4)]),
+    error_logger:info_msg("[QUIC] Derived app keys: ServerKey=~p, ClientKey=~p~n",
+                          [binary:encode_hex(ServerKey), binary:encode_hex(ClientKey)]),
+    error_logger:info_msg("[QUIC] ServerIV=~p, ClientIV=~p~n",
+                          [binary:encode_hex(ServerIV), binary:encode_hex(ClientIV)]),
 
     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
@@ -2604,6 +2637,8 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Compute shared secret
             SharedSecret = quic_crypto:compute_shared_secret(
                 x25519, ServerPrivKey, ClientPubKey),
+            error_logger:info_msg("[QUIC] ECDH SharedSecret=~p~n",
+                                  [binary:encode_hex(SharedSecret)]),
 
             %% Negotiate ALPN
             ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
@@ -2620,12 +2655,22 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Add ServerHello to transcript
             Transcript = <<Transcript0/binary, ServerHello/binary>>,
             TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
+            error_logger:info_msg("[QUIC] HS TranscriptHash (CH||SH)=~p~n",
+                                  [binary:encode_hex(TranscriptHash)]),
+            error_logger:info_msg("[QUIC] ClientHello size=~p, ServerHello size=~p~n",
+                                  [byte_size(OriginalMsg), byte_size(ServerHello)]),
 
             %% Derive handshake secrets using already computed early secret
             HandshakeSecret = quic_crypto:derive_handshake_secret(Cipher, EarlySecret, SharedSecret),
+            error_logger:info_msg("[QUIC] Server HandshakeSecret=~p~n",
+                                  [binary:encode_hex(HandshakeSecret)]),
 
             ClientHsSecret = quic_crypto:derive_client_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
             ServerHsSecret = quic_crypto:derive_server_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
+            error_logger:info_msg("[QUIC] ClientHsSecret=~p~n",
+                                  [binary:encode_hex(ClientHsSecret)]),
+            error_logger:info_msg("[QUIC] ServerHsSecret=~p~n",
+                                  [binary:encode_hex(ServerHsSecret)]),
 
             %% Derive handshake keys
             {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
