@@ -1877,11 +1877,20 @@ send_app_packet_internal(Payload, Frames, State) ->
 
     %% Encrypt
     #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
+    Nonce = quic_aead:compute_nonce(IV, PN),
+    error_logger:info_msg("[QUIC] Short pkt: PN=~p, IV=~p, Nonce=~p~n",
+                          [PN, binary:encode_hex(IV), binary:encode_hex(Nonce)]),
+    error_logger:info_msg("[QUIC] Short pkt: Key=~p, HP=~p~n",
+                          [binary:encode_hex(Key), binary:encode_hex(HP)]),
+    error_logger:info_msg("[QUIC] Short pkt: Header=~p, AAD=~p~n",
+                          [binary:encode_hex(Header), binary:encode_hex(AAD)]),
     Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
     PNOffset = byte_size(Header),
     ProtectedHeader = quic_aead:protect_header(HP, <<Header/binary, PNBin/binary>>, Encrypted, PNOffset),
+    error_logger:info_msg("[QUIC] Short pkt: ProtectedHeader=~p~n",
+                          [binary:encode_hex(ProtectedHeader)]),
 
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
