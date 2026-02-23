@@ -71,6 +71,7 @@
     sockname/1,
     peercert/1,
     set_owner/2,
+    set_owner_sync/2,
     setopts/2,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
@@ -425,10 +426,16 @@ sockname(Conn) ->
 peercert(Conn) ->
     gen_statem:call(Conn, peercert).
 
-%% @doc Set new owner process.
+%% @doc Set new owner process (async).
 -spec set_owner(pid(), pid()) -> ok.
 set_owner(Conn, NewOwner) ->
     gen_statem:cast(Conn, {set_owner, NewOwner}).
+
+%% @doc Set new owner process (sync).
+%% Blocks until ownership is transferred.
+-spec set_owner_sync(pid(), pid()) -> ok.
+set_owner_sync(Conn, NewOwner) ->
+    gen_statem:call(Conn, {set_owner, NewOwner}).
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
@@ -770,6 +777,9 @@ idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
 idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
+idle({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
+
 idle(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
 
@@ -839,6 +849,9 @@ handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
 
 handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
+
+handshaking({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
 
 handshaking(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
@@ -949,6 +962,9 @@ connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
+
+connected({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
 
 connected(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
