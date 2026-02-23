@@ -1813,6 +1813,11 @@ send_app_packet_internal(Payload, Frames, State) ->
         server -> ServerKeys
     end,
 
+    error_logger:info_msg("[QUIC] Encrypting with cipher=~p, key_len=~p, iv_len=~p~n",
+                          [EncryptKeys#crypto_keys.cipher,
+                           byte_size(EncryptKeys#crypto_keys.key),
+                           byte_size(EncryptKeys#crypto_keys.iv)]),
+
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
 
