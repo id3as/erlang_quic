@@ -1735,15 +1735,18 @@ send_coalesced_frames(Frames, State) ->
 
 %% Extract frame info for loss detection tracking
 %% Returns {true, Frame} for valid frames, false for unknown/failed decodes
-decode_frame_for_tracking(FrameBin) ->
+decode_frame_for_tracking(FrameBin) when is_binary(FrameBin) ->
     case quic_frame:decode(FrameBin) of
-        {ok, Frame, _} -> {true, Frame};
-        _ ->
+        {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> {true, Frame};
+        {error, _} ->
             %% Log but don't include unknown frames in tracking
             error_logger:warning_msg("[QUIC] Failed to decode frame for tracking: ~p~n",
                                      [FrameBin]),
             false
-    end.
+    end;
+decode_frame_for_tracking(_) ->
+    %% Non-binary input, skip
+    false.
 
 %% Build an ACK frame from ranges
 %% Our internal format is [{Start, End}, ...] where Start <= End
@@ -1840,7 +1843,7 @@ send_handshake_packet(Payload, State) ->
 send_app_packet(Payload, State) when is_binary(Payload) ->
     %% Try to decode the frame for proper loss tracking
     FrameInfo = case quic_frame:decode(Payload) of
-        {ok, Frame, _Rest} -> [Frame];
+        {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> [Frame];
         _ -> []  % Fall back to empty if decode fails
     end,
     send_app_packet_internal(Payload, FrameInfo, State).
@@ -2441,8 +2444,12 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
-            {NewLossState, AckedPackets, LostPackets} =
-                quic_loss:on_ack_received(LossState, AckFrame, Now),
+            case quic_loss:on_ack_received(LossState, AckFrame, Now) of
+                {error, ack_range_too_large} ->
+                    %% RFC 9000: Invalid ACK range is a protocol violation
+                    error_logger:error_msg("[QUIC] Invalid ACK range received, ignoring~n"),
+                    State;
+                {NewLossState, AckedPackets, LostPackets} ->
 
             %% Calculate total bytes acked and lost
             AckedBytes = lists:sum([P#sent_packet.size || P <- AckedPackets]),
@@ -2494,7 +2501,8 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
             %% Try to send queued data now that cwnd may have freed up
             process_send_queue(State3)
-    end;
+            end  %% close inner case (on_ack_received)
+    end;  %% close outer case (Ranges)
 
 process_frame(_Level, handshake_done, State) ->
     %% Server confirmed handshake complete
@@ -2651,8 +2659,9 @@ process_frame(_Level, _Frame, State) ->
 %% Helper to remove a stream from the send queue (tuple of 8 queues)
 remove_stream_from_queue(StreamId, PQ) ->
     %% Filter out entries for this stream from all 8 priority buckets
+    %% Queue entries are 5-tuples: {stream_data, StreamId, Offset, Data, Fin}
     list_to_tuple([
-        queue:filter(fun({SId, _, _, _}) -> SId =/= StreamId end, element(I, PQ))
+        queue:filter(fun({stream_data, SId, _, _, _}) -> SId =/= StreamId end, element(I, PQ))
     || I <- lists:seq(1, 8)]).
 
 %% Buffer CRYPTO data and process when complete messages are available
@@ -3792,8 +3801,8 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams,
                                                      [DataSize, ConnectionAllowed]),
                             %% Queue for later - MUST return the updated state with queued data!
                             QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
-                            %% Send DATA_BLOCKED frame to inform peer we're blocked
-                            BlockedFrame = quic_frame:encode({data_blocked, DataSent}),
+                            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
+                            BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
                             FinalState = send_app_packet(BlockedFrame, QueuedState),
                             {ok, FinalState};
                         {_, false} ->
@@ -3803,8 +3812,8 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams,
                                                      [StreamId, DataSize, StreamAllowed]),
                             %% Queue for later - MUST return the updated state with queued data!
                             QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
-                            %% Send STREAM_DATA_BLOCKED frame to inform peer we're blocked
-                            BlockedFrame = quic_frame:encode({stream_data_blocked, StreamId, Offset}),
+                            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
+                            BlockedFrame = quic_frame:encode({stream_data_blocked, StreamId, SendMaxData}),
                             FinalState = send_app_packet(BlockedFrame, QueuedState),
                             {ok, FinalState};
                         {true, true} ->
