@@ -1503,6 +1503,7 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
+    error_logger:info_msg("[QUIC] Server sending HANDSHAKE_DONE~n"),
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
     Frame = quic_frame:encode(handshake_done),
     send_app_packet(Frame, State).
@@ -2810,6 +2811,7 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
 %% Server receives client's Finished
 process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_FINISHED} = State) ->
+    error_logger:info_msg("[QUIC] Server received client Finished~n"),
     {ClientHsKeys, _} = State#state.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
