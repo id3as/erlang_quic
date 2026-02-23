@@ -1835,9 +1835,21 @@ send_handshake_packet(Payload, State) ->
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{pn_handshake = NewPNSpace}.
 
-%% Send a 1-RTT (application) packet (without tracking frames for retransmission)
-send_app_packet(Payload, State) ->
-    send_app_packet_internal(Payload, [], State).
+%% Send a 1-RTT (application) packet with frame for retransmission tracking
+%% Decodes the payload to extract frame info for loss tracking
+send_app_packet(Payload, State) when is_binary(Payload) ->
+    %% Try to decode the frame for proper loss tracking
+    FrameInfo = case quic_frame:decode(Payload) of
+        {ok, Frame, _Rest} -> [Frame];
+        _ -> []  % Fall back to empty if decode fails
+    end,
+    send_app_packet_internal(Payload, FrameInfo, State).
+
+%% Send a 1-RTT packet with a single frame (recommended for control frames)
+%% This ensures proper loss tracking for the frame
+send_app_frame(Frame, State) ->
+    Payload = quic_frame:encode(Frame),
+    send_app_packet_internal(Payload, [Frame], State).
 
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
 send_app_packet_internal(Payload, Frames, State) ->
@@ -2493,23 +2505,61 @@ process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
                           [StreamId, Offset, byte_size(Data), Fin]),
     process_stream_data(StreamId, Offset, Data, Fin, State);
 
-process_frame(_Level, {max_data, MaxData}, State) ->
-    State#state{max_data_remote = MaxData};
+%% MAX_DATA: Peer is increasing connection-level flow control limit
+%% RFC 9000 Section 19.9: The max_data field is an unsigned integer indicating the maximum
+%% amount of data that can be sent on the entire connection. This value MUST be >= previous.
+process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = State) ->
+    case MaxData > Current of
+        true ->
+            error_logger:info_msg("[QUIC FC] MAX_DATA increased: ~p -> ~p~n", [Current, MaxData]),
+            %% Limit increased - try to drain queued data
+            State1 = State#state{max_data_remote = MaxData},
+            process_send_queue(State1);
+        false ->
+            %% Monotonic: ignore if not increasing (per RFC 9000)
+            State
+    end;
 
-process_frame(_Level, {max_stream_data, StreamId, MaxData}, State) ->
-    case maps:find(StreamId, State#state.streams) of
-        {ok, Stream} ->
-            NewStream = Stream#stream_state{send_max_data = MaxData},
-            State#state{streams = maps:put(StreamId, NewStream, State#state.streams)};
+%% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
+%% RFC 9000 Section 19.10: Receiving MAX_STREAM_DATA for a send-only stream is an error.
+process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_max_data = Current} = Stream} ->
+            case MaxData > Current of
+                true ->
+                    error_logger:info_msg("[QUIC FC] MAX_STREAM_DATA for stream ~p increased: ~p -> ~p~n",
+                                          [StreamId, Current, MaxData]),
+                    NewStream = Stream#stream_state{send_max_data = MaxData},
+                    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+                    %% Limit increased - try to drain queued data
+                    process_send_queue(State1);
+                false ->
+                    %% Monotonic: ignore if not increasing
+                    State
+            end;
         error ->
             State
     end;
 
-process_frame(_Level, {max_streams, bidi, Max}, State) ->
-    State#state{max_streams_bidi_remote = Max};
+%% MAX_STREAMS: Peer is increasing the number of streams we can open
+%% RFC 9000 Section 19.11: The value MUST be >= previous value
+process_frame(_Level, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
+    case Max > Current of
+        true ->
+            error_logger:info_msg("[QUIC] MAX_STREAMS bidi increased: ~p -> ~p~n", [Current, Max]),
+            State#state{max_streams_bidi_remote = Max};
+        false ->
+            State
+    end;
 
-process_frame(_Level, {max_streams, uni, Max}, State) ->
-    State#state{max_streams_uni_remote = Max};
+process_frame(_Level, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
+    case Max > Current of
+        true ->
+            error_logger:info_msg("[QUIC] MAX_STREAMS uni increased: ~p -> ~p~n", [Current, Max]),
+            State#state{max_streams_uni_remote = Max};
+        false ->
+            State
+    end;
 
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
 process_frame(app, {path_challenge, ChallengeData}, State) ->
@@ -2538,6 +2588,54 @@ process_frame(app, {retire_connection_id, SeqNum}, State) ->
 process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, State) ->
     State#state{close_reason = connection_closed};
 
+%% RESET_STREAM: Peer is aborting a stream they initiated or we initiated for sending
+%% RFC 9000 Section 19.4
+process_frame(app, {reset_stream, StreamId, ErrorCode, FinalSize},
+              #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
+    error_logger:info_msg("[QUIC] Received RESET_STREAM: StreamId=~p, Error=~p, FinalSize=~p~n",
+                          [StreamId, ErrorCode, FinalSize]),
+    %% Notify owner of stream reset
+    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
+    %% Update stream state to reset
+    NewStreams = case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            %% Mark stream as reset, store final size for flow control accounting
+            maps:put(StreamId, Stream#stream_state{
+                state = reset,
+                final_size = FinalSize
+            }, Streams);
+        error ->
+            %% Unknown stream - create minimal state to track reset
+            maps:put(StreamId, #stream_state{
+                id = StreamId,
+                state = reset,
+                final_size = FinalSize
+            }, Streams)
+    end,
+    State#state{streams = NewStreams};
+
+%% STOP_SENDING: Peer wants us to stop sending on a stream
+%% RFC 9000 Section 19.5
+process_frame(app, {stop_sending, StreamId, ErrorCode},
+              #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
+    error_logger:info_msg("[QUIC] Received STOP_SENDING: StreamId=~p, Error=~p~n",
+                          [StreamId, ErrorCode]),
+    %% Notify owner - they should stop sending and may send RESET_STREAM
+    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
+    %% Clear any queued data for this stream and mark as stopped
+    NewStreams = case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            maps:put(StreamId, Stream#stream_state{
+                state = stopped,
+                send_buffer = []  % Clear queued data
+            }, Streams);
+        error ->
+            Streams
+    end,
+    %% Also remove from send queue
+    NewSendQueue = remove_stream_from_queue(StreamId, State#state.send_queue),
+    State#state{streams = NewStreams, send_queue = NewSendQueue};
+
 %% DATAGRAM frames (RFC 9221)
 process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
     Owner ! {quic, Ref, {datagram, Data}},
@@ -2549,6 +2647,13 @@ process_frame(app, {datagram_with_length, Data}, #state{owner = Owner, conn_ref 
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
+
+%% Helper to remove a stream from the send queue
+remove_stream_from_queue(StreamId, PQ) ->
+    %% Filter out entries for this stream from all priority buckets
+    maps:map(fun(_Priority, Queue) ->
+        queue:filter(fun({SId, _, _, _}) -> SId =/= StreamId end, Queue)
+    end, PQ).
 
 %% Buffer CRYPTO data and process when complete messages are available
 buffer_crypto_data(Level, Offset, Data, State) ->
@@ -3018,18 +3123,48 @@ process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
 %%====================================================================
 
 process_stream_data(StreamId, Offset, Data, Fin, State) ->
-    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State,
+    #state{owner = Owner, conn_ref = Ref, streams = Streams, role = Role} = State,
+
+    %% RFC 9000 Section 2.1: Validate stream direction
+    %% Cannot receive on locally-initiated unidirectional streams
+    case validate_receive_stream(StreamId, Role) of
+        {error, Reason} ->
+            error_logger:warning_msg("[QUIC] Invalid receive stream ~p: ~p~n", [StreamId, Reason]),
+            State;  % Silently ignore (could send STREAM_STATE_ERROR)
+        ok ->
+            process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+    end.
+
+%% Validate that we can receive on this stream
+validate_receive_stream(StreamId, Role) ->
+    IsUni = (StreamId band 2) =/= 0,
+    IsLocallyInitiated = case Role of
+        client -> (StreamId band 1) =:= 0;
+        server -> (StreamId band 1) =:= 1
+    end,
+    case {IsUni, IsLocallyInitiated} of
+        {true, true} ->
+            %% Cannot receive on our own unidirectional stream
+            {error, stream_state_error};
+        _ ->
+            ok
+    end.
+
+process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
+    #state{owner = Owner, conn_ref = Ref, streams = Streams,
+           max_data_local = MaxDataLocal, data_received = DataReceived} = State,
+
+    DataSize = byte_size(Data),
 
     %% Get or create stream state
-    Stream = case maps:find(StreamId, Streams) of
-        {ok, S} -> S;
+    {Stream, IsNew} = case maps:find(StreamId, Streams) of
+        {ok, S} -> {S, false};
         error ->
             %% New stream from peer - use peer's limits for streams they initiate
-            %% For bidi streams peer initiated, use peer's initial_max_stream_data_bidi_local
             SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
             error_logger:info_msg("[QUIC] New peer-initiated stream ~p with send_max_data=~p~n",
                                   [StreamId, SendMaxData]),
-            #stream_state{
+            {#stream_state{
                 id = StreamId,
                 state = open,
                 send_offset = 0,
@@ -3039,85 +3174,112 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
                 recv_offset = 0,
                 recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
                 recv_fin = false,
-                recv_buffer = #{},  %% Map for out-of-order reassembly
+                recv_buffer = #{},
                 final_size = undefined
-            }
+            }, true}
     end,
 
-    %% Store data in buffer at its offset (handles duplicates gracefully)
-    RecvBuffer = case Stream#stream_state.recv_buffer of
-        B when is_map(B) -> B;
-        _ -> #{}  %% Upgrade old binary buffer format
-    end,
-    UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
-
-    %% Track FIN position if received
-    FinalSize = case Fin of
-        true -> Offset + byte_size(Data);
-        false -> Stream#stream_state.final_size
-    end,
-
-    %% Extract contiguous data starting from recv_offset and deliver it
-    CurrentOffset = Stream#stream_state.recv_offset,
-    {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(UpdatedBuffer, CurrentOffset),
-
-    %% Determine if we should deliver FIN (all data up to FIN has been delivered)
-    DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
-
-    %% Deliver contiguous data to owner (may be empty if out-of-order)
-    case DeliverData of
-        <<>> ->
-            ok;  %% No contiguous data to deliver yet
-        _ ->
-            Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
-    end,
-
-    NewStream = Stream#stream_state{
-        recv_offset = NewRecvOffset,
-        recv_fin = DeliverFin,
-        recv_buffer = NewBuffer,
-        final_size = FinalSize
-    },
-
-    %% Track connection-level data received (RFC 9000 Section 4.1)
-    DataSize = byte_size(Data),
-    NewDataReceived = State#state.data_received + DataSize,
-    State1 = State#state{
-        streams = maps:put(StreamId, NewStream, Streams),
-        data_received = NewDataReceived
-    },
-
-    %% Check if we need to send MAX_STREAM_DATA to allow more data
-    %% Send when we've consumed more than half our advertised limit
+    %% RFC 9000 Section 4.1: Check receive flow control limits BEFORE buffering
+    EndOffset = Offset + DataSize,
     RecvMaxData = Stream#stream_state.recv_max_data,
-    State2 = case NewRecvOffset > (RecvMaxData div 2) of
-        true ->
-            %% Double the limit and send MAX_STREAM_DATA
-            NewMaxStreamData = RecvMaxData * 2,
-            UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
-            MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxStreamData}),
-            State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
-            send_app_packet(MaxStreamDataFrame, State1a);
-        false ->
-            State1
-    end,
+    case {EndOffset > RecvMaxData, DataReceived + DataSize > MaxDataLocal} of
+        {true, _} ->
+            %% Stream-level flow control violation
+            error_logger:warning_msg("[QUIC FC] Stream ~p flow control violation: end=~p > max=~p~n",
+                                     [StreamId, EndOffset, RecvMaxData]),
+            State;  % Could send FLOW_CONTROL_ERROR
+        {_, true} ->
+            %% Connection-level flow control violation
+            error_logger:warning_msg("[QUIC FC] Connection flow control violation: recv=~p > max=~p~n",
+                                     [DataReceived + DataSize, MaxDataLocal]),
+            State;  % Could send FLOW_CONTROL_ERROR
+        _ ->
+            %% Flow control OK - proceed with buffering
+            RecvBuffer = case Stream#stream_state.recv_buffer of
+                B when is_map(B) -> B;
+                _ -> #{}
+            end,
 
-    %% Check if we need to send MAX_DATA for connection-level flow control
-    %% Send when we've consumed more than 50% of our advertised connection window
-    MaxDataLocal = State2#state.max_data_local,
-    State3 = case NewDataReceived > (MaxDataLocal div 2) of
-        true ->
-            %% Extend the connection-level window and send MAX_DATA
-            NewMaxData = NewDataReceived + MaxDataLocal,
-            MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
-            State2a = send_app_packet(MaxDataFrame, State2),
-            State2a#state{max_data_local = NewMaxData};
-        false ->
-            State2
-    end,
+            %% Check if this is duplicate data (already have data at this offset)
+            CurrentOffset = Stream#stream_state.recv_offset,
+            IsDuplicate = Offset < CurrentOffset orelse maps:is_key(Offset, RecvBuffer),
 
-    %% ACK is sent at packet level by maybe_send_ack
-    State3.
+            %% Store data in buffer (handles duplicates gracefully - overwrites)
+            UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+
+            %% Track FIN position if received
+            FinalSize = case Fin of
+                true -> EndOffset;
+                false -> Stream#stream_state.final_size
+            end,
+
+            %% Extract contiguous data starting from recv_offset and deliver it
+            {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(UpdatedBuffer, CurrentOffset),
+
+            %% Determine if we should deliver FIN (all data up to FIN has been delivered)
+            DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
+
+            %% Deliver contiguous data to owner
+            %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
+            case {DeliverData, DeliverFin, Fin} of
+                {<<>>, false, _} ->
+                    ok;  %% No contiguous data to deliver yet
+                {<<>>, true, _} ->
+                    %% FIN-only delivery (all data already delivered)
+                    Owner ! {quic, Ref, {stream_data, StreamId, <<>>, true}};
+                {_, _, _} ->
+                    Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
+            end,
+
+            NewStream = Stream#stream_state{
+                recv_offset = NewRecvOffset,
+                recv_fin = DeliverFin,
+                recv_buffer = NewBuffer,
+                final_size = FinalSize
+            },
+
+            %% Track connection-level data received - only count NEW bytes, not duplicates
+            NewBytesReceived = case IsDuplicate of
+                true -> 0;
+                false -> DataSize
+            end,
+            NewDataReceivedVal = DataReceived + NewBytesReceived,
+            State1 = State#state{
+                streams = maps:put(StreamId, NewStream, Streams),
+                data_received = NewDataReceivedVal
+            },
+
+            %% Check if we need to send MAX_STREAM_DATA to allow more data
+            %% Send when we've consumed more than half our advertised limit
+            State2 = case NewRecvOffset > (RecvMaxData div 2) of
+                true ->
+                    %% Double the limit and send MAX_STREAM_DATA
+                    NewMaxStreamData = RecvMaxData * 2,
+                    UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
+                    MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxStreamData}),
+                    State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
+                    send_app_packet(MaxStreamDataFrame, State1a);
+                false ->
+                    State1
+            end,
+
+            %% Check if we need to send MAX_DATA for connection-level flow control
+            %% Send when we've consumed more than 50% of our advertised connection window
+            MaxDataLocalVal = State2#state.max_data_local,
+            State3 = case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                true ->
+                    %% Extend the connection-level window and send MAX_DATA
+                    NewMaxData = NewDataReceivedVal + MaxDataLocalVal,
+                    MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
+                    State2a = send_app_packet(MaxDataFrame, State2),
+                    State2a#state{max_data_local = NewMaxData};
+                false ->
+                    State2
+            end,
+
+            %% ACK is sent at packet level by maybe_send_ack
+            State3
+    end.
 
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
@@ -3459,11 +3621,18 @@ update_last_activity(State) ->
     set_idle_timer(State1).
 
 %% Open a new stream
-do_open_stream(#state{next_stream_id_bidi = NextId,
+%% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
+%% Client bidi=0x00, Server bidi=0x01, Client uni=0x02, Server uni=0x03
+do_open_stream(#state{role = Role, next_stream_id_bidi = NextId,
                       max_streams_bidi_remote = Max,
                       streams = Streams} = State) ->
+    %% Count streams WE initiated (not peer-initiated)
+    LocalPattern = case Role of
+        client -> 0;  % Client-initiated bidi = 0x00
+        server -> 1   % Server-initiated bidi = 0x01
+    end,
     StreamCount = maps:size(maps:filter(fun(Id, _) ->
-        (Id band 16#03) =:= 0  % Client-initiated bidi
+        (Id band 16#03) =:= LocalPattern
     end, Streams)),
     if
         StreamCount >= Max ->
@@ -3494,11 +3663,16 @@ do_open_stream(#state{next_stream_id_bidi = NextId,
     end.
 
 %% Open a new unidirectional stream
-do_open_unidirectional_stream(#state{next_stream_id_uni = NextId,
+do_open_unidirectional_stream(#state{role = Role, next_stream_id_uni = NextId,
                                       max_streams_uni_remote = Max,
                                       streams = Streams} = State) ->
+    %% Count uni streams WE initiated
+    LocalPattern = case Role of
+        client -> 2;  % Client-initiated uni = 0x02
+        server -> 3   % Server-initiated uni = 0x03
+    end,
     StreamCount = maps:size(maps:filter(fun(Id, _) ->
-        (Id band 16#03) =:= 2  % Client-initiated uni
+        (Id band 16#03) =:= LocalPattern
     end, Streams)),
     if
         StreamCount >= Max ->
@@ -3635,18 +3809,25 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams,
                             {ok, FinalState};
                         {true, true} ->
                             %% Flow control allows sending
-                            %% Update stream state BEFORE sending to maintain correct offset tracking
-                            NewStreamState = StreamState#stream_state{
-                                send_offset = Offset + DataSize,
-                                send_fin = Fin
-                            },
-                            UpdatedState = State#state{
-                                streams = maps:put(StreamId, NewStreamState, Streams),
-                                data_sent = DataSent + DataSize
-                            },
-                            %% Fragment and send data using updated state
-                            NewState = send_stream_data_fragmented(StreamId, Offset, DataBin, Fin, UpdatedState),
-                            {ok, NewState}
+                            %% Fragment and send data - let it handle state updates per fragment
+                            %% This ensures send_offset/data_sent are only updated for data actually sent
+                            {NewState, BytesSent} = send_stream_data_fragmented_tracked(
+                                StreamId, Offset, DataBin, Fin, State),
+                            %% Update stream state based on what was actually sent
+                            case maps:find(StreamId, NewState#state.streams) of
+                                {ok, UpdatedStream} ->
+                                    FinalStream = UpdatedStream#stream_state{
+                                        send_offset = Offset + BytesSent,
+                                        send_fin = (Fin andalso BytesSent =:= DataSize)
+                                    },
+                                    FinalState = NewState#state{
+                                        streams = maps:put(StreamId, FinalStream, NewState#state.streams),
+                                        data_sent = NewState#state.data_sent + BytesSent
+                                    },
+                                    {ok, FinalState};
+                                error ->
+                                    {ok, NewState}
+                            end
                     end
             end;
         error ->
@@ -3752,6 +3933,51 @@ do_send_datagram(Data, #state{cc_state = CCState} = State) ->
         false ->
             %% Datagrams are unreliable - just drop if cwnd is full
             {error, congestion_limited}
+    end.
+
+%% Send stream data in fragments, tracking how many bytes were actually sent
+%% Returns {NewState, BytesSent} where BytesSent is the count of bytes actually transmitted
+%% (not queued due to congestion)
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
+    send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, 0).
+
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar)
+  when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
+    %% Data fits in one packet - check congestion window
+    #state{cc_state = CCState} = State,
+    PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    case CanSend of
+        true ->
+            Frame = {stream, StreamId, Offset, Data, Fin},
+            Payload = quic_frame:encode(Frame),
+            NewState = send_app_packet_internal(Payload, [Frame], State),
+            {NewState, BytesSentSoFar + byte_size(Data)};
+        false ->
+            %% Queue the data for later sending when cwnd allows
+            error_logger:warning_msg("[QUIC CC] QUEUING data for StreamId=~p due to congestion~n", [StreamId]),
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
+            {QueuedState, BytesSentSoFar}  % Return bytes sent so far, not including queued
+    end;
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
+    %% Split data into chunks and send what we can
+    #state{cc_state = CCState} = State,
+    PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    case CanSend of
+        true ->
+            <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
+            Frame = {stream, StreamId, Offset, Chunk, false},
+            Payload = quic_frame:encode(Frame),
+            State1 = send_app_packet_internal(Payload, [Frame], State),
+            NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
+            NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
+            send_stream_data_fragmented_tracked(StreamId, NewOffset, Rest, Fin, State1, NewBytesSent);
+        false ->
+            %% Queue remaining data for later
+            error_logger:warning_msg("[QUIC CC] QUEUING remaining data for StreamId=~p due to congestion~n", [StreamId]),
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
+            {QueuedState, BytesSentSoFar}  % Return bytes sent so far
     end.
 
 %% Send stream data in fragments that fit in packets
