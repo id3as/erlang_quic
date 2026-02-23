@@ -2189,8 +2189,11 @@ find_matching_reset_token(Token, [_ | Rest]) ->
     find_matching_reset_token(Token, Rest).
 
 decode_short_header_packet(Data, State) ->
+    error_logger:info_msg("[QUIC] decode_short_header_packet called, data_size=~p, has_app_keys=~p~n",
+                          [byte_size(Data), State#state.app_keys =/= undefined]),
     case State#state.app_keys of
         undefined ->
+            error_logger:warning_msg("[QUIC] No app keys yet for short header packet~n"),
             %% No app keys yet - check if this might be a stateless reset
             check_stateless_reset(Data, State);
         {ClientKeys, ServerKeys} ->
@@ -2206,11 +2209,16 @@ decode_short_header_packet(Data, State) ->
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
             case decrypt_app_packet(Header, EncryptedPayload, DecryptKeys, State) of
-                {error, decryption_failed} ->
+                {error, decryption_failed} = Err ->
+                    error_logger:warning_msg("[QUIC] Short header decryption failed~n"),
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);
-                Result ->
-                    Result
+                {ok, Type, Frames, Remaining, NewState} = Result ->
+                    error_logger:info_msg("[QUIC] Short header decrypted OK, frames=~p~n", [Frames]),
+                    Result;
+                Other ->
+                    error_logger:info_msg("[QUIC] Short header decrypt result: ~p~n", [Other]),
+                    Other
             end
     end.
 
@@ -2390,6 +2398,8 @@ process_frame(_Level, handshake_done, State) ->
     State;
 
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
+    error_logger:info_msg("[QUIC] Processing STREAM frame: StreamId=~p, Offset=~p, DataSize=~p, Fin=~p~n",
+                          [StreamId, Offset, byte_size(Data), Fin]),
     process_stream_data(StreamId, Offset, Data, Fin, State);
 
 process_frame(_Level, {max_data, MaxData}, State) ->
