@@ -397,8 +397,12 @@ route_to_connection(DCID, Packet, RemoteAddr,
                     #listener_state{connections = Conns} = State) ->
     case ets:lookup(Conns, DCID) of
         [{DCID, ConnPid}] ->
+            error_logger:info_msg("[QUIC listener] Routing packet to ~p (DCID=~p, size=~p)~n",
+                                  [ConnPid, DCID, byte_size(Packet)]),
             send_to_connection(ConnPid, Packet, RemoteAddr);
         [] ->
+            error_logger:warning_msg("[QUIC listener] No connection for DCID=~p, registered=~p~n",
+                                     [DCID, ets:tab2list(Conns)]),
             %% Unknown connection - potentially send stateless reset
             handle_unknown_packet(DCID, Packet, RemoteAddr, State)
     end.
