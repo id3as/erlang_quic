@@ -1444,8 +1444,8 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     end,
 
     %% Build EncryptedExtensions
-    error_logger:info_msg("[QUIC] Building EncExt: ALPN=~p, TP keys=~p~n",
-                          [ALPN, maps:keys(TransportParams)]),
+    error_logger:info_msg("[QUIC] Building EncExt: ALPN=~p~n", [ALPN]),
+    error_logger:info_msg("[QUIC] TransportParams=~p~n", [TransportParams]),
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
         alpn => ALPN,
         transport_params => TransportParams
