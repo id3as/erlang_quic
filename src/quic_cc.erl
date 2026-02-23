@@ -31,6 +31,7 @@
     %% Congestion control events
     on_packet_sent/2,
     on_packets_acked/2,
+    on_packets_acked/3,  %% With LargestAckedSentTime for proper recovery exit
     on_packets_lost/2,
     on_congestion_event/2,
 
@@ -126,14 +127,50 @@ on_packet_sent(#cc_state{bytes_in_flight = InFlight} = State, Size) ->
 
 %% @doc Process acknowledged packets.
 %% AckedBytes is the total size of acknowledged packets.
+%% LargestAckedSentTime is the time when the largest acknowledged packet was sent.
+%% RFC 9002: Exit recovery when the largest acked packet was sent after recovery started.
 -spec on_packets_acked(cc_state(), non_neg_integer()) -> cc_state().
-on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true} = State,
-                 AckedBytes) ->
-    %% In recovery, don't increase cwnd
-    State#cc_state{bytes_in_flight = max(0, InFlight - AckedBytes)};
+on_packets_acked(State, AckedBytes) ->
+    %% Use current time as a proxy - ideally caller would pass largest_acked_sent_time
+    Now = erlang:monotonic_time(millisecond),
+    on_packets_acked(State, AckedBytes, Now).
+
+-spec on_packets_acked(cc_state(), non_neg_integer(), non_neg_integer()) -> cc_state().
+on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
+                           recovery_start_time = RecoveryStart} = State,
+                 AckedBytes, LargestAckedSentTime) ->
+    NewInFlight = max(0, InFlight - AckedBytes),
+    %% RFC 9002 Section 7.3.2: A recovery period ends and the sender
+    %% enters congestion avoidance when a packet sent during the recovery period
+    %% is acknowledged. Check if the largest acked packet was sent AFTER recovery started.
+    case LargestAckedSentTime > RecoveryStart of
+        true ->
+            %% Exit recovery - packet sent after recovery started was acked
+            error_logger:info_msg("[QUIC CC] Exiting recovery: largest_acked_sent=~p > recovery_start=~p~n",
+                                  [LargestAckedSentTime, RecoveryStart]),
+            %% Now in congestion avoidance, can increase cwnd
+            #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
+            NewCwnd = case Cwnd < SSThresh of
+                true -> Cwnd + AckedBytes;
+                false ->
+                    Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
+                    Cwnd + max(Increment, 1)
+            end,
+            State#cc_state{
+                bytes_in_flight = NewInFlight,
+                in_recovery = false,
+                recovery_start_time = undefined,
+                cwnd = NewCwnd
+            };
+        false ->
+            %% Still in recovery, don't increase cwnd
+            error_logger:info_msg("[QUIC CC] Still in recovery: largest_acked_sent=~p <= recovery_start=~p~n",
+                                  [LargestAckedSentTime, RecoveryStart]),
+            State#cc_state{bytes_in_flight = NewInFlight}
+    end;
 on_packets_acked(#cc_state{cwnd = Cwnd, ssthresh = SSThresh,
                            bytes_in_flight = InFlight,
-                           max_datagram_size = MaxDS} = State, AckedBytes) ->
+                           max_datagram_size = MaxDS} = State, AckedBytes, _LargestAckedSentTime) ->
     NewInFlight = max(0, InFlight - AckedBytes),
 
     %% Increase cwnd based on phase
