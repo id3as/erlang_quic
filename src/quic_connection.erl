@@ -1464,6 +1464,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     Transcript3 = <<Transcript2/binary, FinishedMsg/binary>>,
     TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript3),
 
+    error_logger:info_msg("[QUIC] App key derivation: transcript_size=~p, transcript_hash_prefix=~p~n",
+                          [byte_size(Transcript3), binary:part(TranscriptHashFinal, 0, 8)]),
+
     %% Derive master secret and application keys
     MasterSecret = quic_crypto:derive_master_secret(Cipher, HandshakeSecret),
     ClientAppSecret = quic_crypto:derive_client_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
@@ -1472,6 +1475,9 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
+
+    error_logger:info_msg("[QUIC] Derived app keys: ServerKey_prefix=~p, ClientKey_prefix=~p~n",
+                          [binary:part(ServerKey, 0, 4), binary:part(ClientKey, 0, 4)]),
 
     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
