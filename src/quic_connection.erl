@@ -1729,14 +1729,20 @@ dequeue_small_stream_frame(#state{send_queue = PQ} = State) ->
 send_coalesced_frames(Frames, State) ->
     Payload = iolist_to_binary(Frames),
     %% Extract decoded frame info for loss tracking
-    FrameInfo = lists:map(fun decode_frame_for_tracking/1, Frames),
+    %% Filter out unknown frames to avoid issues with retransmission
+    FrameInfo = lists:filtermap(fun decode_frame_for_tracking/1, Frames),
     send_app_packet_internal(Payload, FrameInfo, State).
 
 %% Extract frame info for loss detection tracking
+%% Returns {true, Frame} for valid frames, false for unknown/failed decodes
 decode_frame_for_tracking(FrameBin) ->
     case quic_frame:decode(FrameBin) of
-        {ok, Frame, _} -> Frame;
-        _ -> unknown
+        {ok, Frame, _} -> {true, Frame};
+        _ ->
+            %% Log but don't include unknown frames in tracking
+            error_logger:warning_msg("[QUIC] Failed to decode frame for tracking: ~p~n",
+                                     [FrameBin]),
+            false
     end.
 
 %% Build an ACK frame from ranges
@@ -3326,22 +3332,35 @@ select_signature_algorithm(_) ->
 
 %% Check if we should transition to a new state
 check_state_transition(CurrentState, State) ->
-    case {CurrentState, State#state.tls_state, has_app_keys(State)} of
-        {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
-            %% Got ServerHello, have handshake keys
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_CERT, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_FINISHED, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
-            {next_state, connected, State};
-        {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
-            {next_state, connected, State};
+    %% First check if connection should be closing (CONNECTION_CLOSE received)
+    case State#state.close_reason of
+        connection_closed ->
+            %% Peer sent CONNECTION_CLOSE, transition to draining
+            error_logger:info_msg("[QUIC] Peer sent CONNECTION_CLOSE, transitioning to draining~n"),
+            {next_state, draining, State};
+        stateless_reset ->
+            %% Received stateless reset, transition to draining
+            error_logger:info_msg("[QUIC] Received stateless reset, transitioning to draining~n"),
+            {next_state, draining, State};
         _ ->
-            {keep_state, State}
+            %% Check for TLS handshake state transitions
+            case {CurrentState, State#state.tls_state, has_app_keys(State)} of
+                {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
+                    %% Got ServerHello, have handshake keys
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_CERT, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_FINISHED, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    {next_state, connected, State};
+                {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    {next_state, connected, State};
+                _ ->
+                    {keep_state, State}
+            end
     end.
 
 has_app_keys(#state{app_keys = undefined}) -> false;
@@ -3597,32 +3616,37 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams,
                             error_logger:warning_msg("[QUIC FC] Connection flow control blocked: "
                                                      "need ~p, allowed ~p~n",
                                                      [DataSize, ConnectionAllowed]),
-                            %% Queue for later or send DATA_BLOCKED
-                            queue_stream_data(StreamId, Offset, DataBin, Fin, State),
-                            {ok, State};
+                            %% Queue for later - MUST return the updated state with queued data!
+                            QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
+                            %% Send DATA_BLOCKED frame to inform peer we're blocked
+                            BlockedFrame = quic_frame:encode({data_blocked, DataSent}),
+                            FinalState = send_app_packet(BlockedFrame, QueuedState),
+                            {ok, FinalState};
                         {_, false} ->
                             %% Stream-level flow control blocked
                             error_logger:warning_msg("[QUIC FC] Stream ~p flow control blocked: "
                                                      "need ~p, allowed ~p~n",
                                                      [StreamId, DataSize, StreamAllowed]),
-                            %% Queue for later or send STREAM_DATA_BLOCKED
-                            queue_stream_data(StreamId, Offset, DataBin, Fin, State),
-                            {ok, State};
+                            %% Queue for later - MUST return the updated state with queued data!
+                            QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
+                            %% Send STREAM_DATA_BLOCKED frame to inform peer we're blocked
+                            BlockedFrame = quic_frame:encode({stream_data_blocked, StreamId, Offset}),
+                            FinalState = send_app_packet(BlockedFrame, QueuedState),
+                            {ok, FinalState};
                         {true, true} ->
                             %% Flow control allows sending
-                            %% Fragment and send data
-                            NewState = send_stream_data_fragmented(StreamId, Offset, DataBin, Fin, State),
-
-                            %% Update stream state and connection-level data_sent
+                            %% Update stream state BEFORE sending to maintain correct offset tracking
                             NewStreamState = StreamState#stream_state{
                                 send_offset = Offset + DataSize,
                                 send_fin = Fin
                             },
-
-                            {ok, NewState#state{
+                            UpdatedState = State#state{
                                 streams = maps:put(StreamId, NewStreamState, Streams),
                                 data_sent = DataSent + DataSize
-                            }}
+                            },
+                            %% Fragment and send data using updated state
+                            NewState = send_stream_data_fragmented(StreamId, Offset, DataBin, Fin, UpdatedState),
+                            {ok, NewState}
                     end
             end;
         error ->
