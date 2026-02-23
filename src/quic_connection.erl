@@ -2648,12 +2648,12 @@ process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
 
-%% Helper to remove a stream from the send queue
+%% Helper to remove a stream from the send queue (tuple of 8 queues)
 remove_stream_from_queue(StreamId, PQ) ->
-    %% Filter out entries for this stream from all priority buckets
-    maps:map(fun(_Priority, Queue) ->
-        queue:filter(fun({SId, _, _, _}) -> SId =/= StreamId end, Queue)
-    end, PQ).
+    %% Filter out entries for this stream from all 8 priority buckets
+    list_to_tuple([
+        queue:filter(fun({SId, _, _, _}) -> SId =/= StreamId end, element(I, PQ))
+    || I <- lists:seq(1, 8)]).
 
 %% Buffer CRYPTO data and process when complete messages are available
 buffer_crypto_data(Level, Offset, Data, State) ->
