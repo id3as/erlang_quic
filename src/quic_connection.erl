@@ -2012,10 +2012,17 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     %% - Client: update dcid to server's SCID
     %% - Server: update dcid to client's SCID
     State1 = case State#state.dcid of
-        <<>> -> State#state{dcid = PeerSCID};  % First packet, set DCID
+        <<>> ->
+            error_logger:info_msg("[QUIC] Setting DCID from peer SCID: ~p~n", [PeerSCID]),
+            State#state{dcid = PeerSCID};  % First packet, set DCID
         _ when State#state.dcid =:= State#state.original_dcid ->
+            error_logger:info_msg("[QUIC] Updating DCID from peer SCID: ~p (was ~p)~n",
+                                  [PeerSCID, State#state.dcid]),
             State#state{dcid = PeerSCID};  % Client updates dcid after first server packet
-        _ -> State  % Already updated
+        _ ->
+            error_logger:info_msg("[QUIC] Keeping DCID: ~p (peer SCID was ~p)~n",
+                                  [State#state.dcid, PeerSCID]),
+            State  % Already updated
     end,
 
     %% Ensure we have enough data
