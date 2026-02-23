@@ -1827,7 +1827,10 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
-    gen_udp:send(Socket, IP, Port, Packet),
+    SendResult = gen_udp:send(Socket, IP, Port, Packet),
+    error_logger:info_msg("[QUIC] send_app_packet_internal: PN=~p, PacketSize=~p, "
+                          "Frames=~p, Dest=~p:~p, Result=~p~n",
+                          [PN, PacketSize, Frames, IP, Port, SendResult]),
 
     %% Track sent packet for loss detection and congestion control
     %% Determine if ack-eliciting (not ACK-only or padding-only)
@@ -3478,22 +3481,36 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(D
     %% Data fits in one packet - check congestion window
     #state{cc_state = CCState} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    Cwnd = quic_cc:cwnd(CCState),
+    InFlight = quic_cc:bytes_in_flight(CCState),
+    error_logger:info_msg("[QUIC CC] send_stream_data_fragmented: StreamId=~p, DataSize=~p, PacketSize=~p, "
+                          "can_send=~p, cwnd=~p, bytes_in_flight=~p~n",
+                          [StreamId, byte_size(Data), PacketSize, CanSend, Cwnd, InFlight]),
 
-    case quic_cc:can_send(CCState, PacketSize) of
+    case CanSend of
         true ->
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode(Frame),
             send_app_packet_internal(Payload, [Frame], State);
         false ->
             %% Queue the data for later sending when cwnd allows
+            error_logger:warning_msg("[QUIC CC] QUEUING data for StreamId=~p due to congestion (cwnd=~p, in_flight=~p)~n",
+                                     [StreamId, Cwnd, InFlight]),
             queue_stream_data(StreamId, Offset, Data, Fin, State)
     end;
 send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
     %% Split data into chunks and send what we can
     #state{cc_state = CCState} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    Cwnd = quic_cc:cwnd(CCState),
+    InFlight = quic_cc:bytes_in_flight(CCState),
+    error_logger:info_msg("[QUIC CC] send_stream_data_fragmented (large): StreamId=~p, TotalSize=~p, PacketSize=~p, "
+                          "can_send=~p, cwnd=~p, bytes_in_flight=~p~n",
+                          [StreamId, byte_size(Data), PacketSize, CanSend, Cwnd, InFlight]),
 
-    case quic_cc:can_send(CCState, PacketSize) of
+    case CanSend of
         true ->
             <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
             Frame = {stream, StreamId, Offset, Chunk, false},
@@ -3503,6 +3520,8 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
             send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
         false ->
             %% Queue remaining data for later
+            error_logger:warning_msg("[QUIC CC] QUEUING large data for StreamId=~p due to congestion (cwnd=~p, in_flight=~p)~n",
+                                     [StreamId, Cwnd, InFlight]),
             queue_stream_data(StreamId, Offset, Data, Fin, State)
     end.
 
