@@ -1813,10 +1813,8 @@ send_app_packet_internal(Payload, Frames, State) ->
         server -> ServerKeys
     end,
 
-    error_logger:info_msg("[QUIC] Encrypting with cipher=~p, key_len=~p, iv_len=~p~n",
-                          [EncryptKeys#crypto_keys.cipher,
-                           byte_size(EncryptKeys#crypto_keys.key),
-                           byte_size(EncryptKeys#crypto_keys.iv)]),
+    error_logger:info_msg("[QUIC] Encrypting: key_prefix=~p, role=~p~n",
+                          [binary:part(EncryptKeys#crypto_keys.key, 0, 4), Role]),
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -2195,8 +2193,13 @@ find_matching_reset_token(Token, [_ | Rest]) ->
     find_matching_reset_token(Token, Rest).
 
 decode_short_header_packet(Data, State) ->
-    error_logger:info_msg("[QUIC] decode_short_header_packet called, data_size=~p, has_app_keys=~p~n",
-                          [byte_size(Data), State#state.app_keys =/= undefined]),
+    case State#state.app_keys of
+        {CKeys, SKeys} ->
+            error_logger:info_msg("[QUIC] decode_short: ClientKey=~p, ServerKey=~p~n",
+                                  [binary:part(CKeys#crypto_keys.key, 0, 4),
+                                   binary:part(SKeys#crypto_keys.key, 0, 4)]);
+        _ -> ok
+    end,
     case State#state.app_keys of
         undefined ->
             error_logger:warning_msg("[QUIC] No app keys yet for short header packet~n"),
