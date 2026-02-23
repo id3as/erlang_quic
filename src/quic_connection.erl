@@ -1461,9 +1461,11 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
     %% Build CertificateVerify - select signature algorithm based on key type
     SigAlg = select_signature_algorithm(PrivateKey),
+    error_logger:info_msg("[QUIC] CertificateVerify: SigAlg=~p (0x~4.16.0B), KeyType=~p~n",
+                          [SigAlg, SigAlg, element(1, PrivateKey)]),
     CertVerifyMsg = quic_tls:build_certificate_verify(SigAlg, PrivateKey, TranscriptHashForCV),
-    error_logger:info_msg("[QUIC] TLS msg sizes: CertVerify=~p~n",
-                          [byte_size(CertVerifyMsg)]),
+    error_logger:info_msg("[QUIC] TLS msg sizes: CertVerify=~p, first_bytes=~p~n",
+                          [byte_size(CertVerifyMsg), binary:encode_hex(binary:part(CertVerifyMsg, 0, min(20, byte_size(CertVerifyMsg))))]),
 
     %% Update transcript after CertificateVerify
     Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
@@ -4056,21 +4058,40 @@ get_stream_urgency(StreamId, Streams) ->
 
 %% Process send queue when congestion window frees up
 %% Processes streams in priority order (lower urgency = higher priority)
-process_send_queue(#state{send_queue = PQ} = State) ->
+process_send_queue(#state{send_queue = PQ, streams = Streams} = State) ->
     case pqueue_out(PQ) of
         {empty, _} ->
             State;
         {{value, {stream_data, StreamId, Offset, Data, Fin}}, NewPQ} ->
             State1 = State#state{send_queue = NewPQ},
-            State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
+            %% Use tracked sender to properly update send_offset/data_sent
+            {State2, BytesSent} = send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1),
+            %% Update stream state with bytes actually sent
+            State3 = case BytesSent > 0 of
+                true ->
+                    case maps:find(StreamId, Streams) of
+                        {ok, Stream} ->
+                            NewStream = Stream#stream_state{
+                                send_offset = Stream#stream_state.send_offset + BytesSent
+                            },
+                            State2#state{
+                                streams = maps:put(StreamId, NewStream, State2#state.streams),
+                                data_sent = State2#state.data_sent + BytesSent
+                            };
+                        error ->
+                            State2
+                    end;
+                false ->
+                    State2
+            end,
             %% If data was queued again (cwnd still full), stop processing
-            case pqueue_is_empty(State2#state.send_queue) of
-                true -> State2;
+            case pqueue_is_empty(State3#state.send_queue) of
+                true -> State3;
                 false ->
                     %% Check if we just queued more data (cwnd full)
-                    case State2#state.send_queue =:= State1#state.send_queue of
-                        true -> process_send_queue(State2);  % Keep processing
-                        false -> State2  % New data queued, cwnd full
+                    case State3#state.send_queue =:= State1#state.send_queue of
+                        true -> process_send_queue(State3);  % Keep processing
+                        false -> State3  % New data queued, cwnd full
                     end
             end
     end.
