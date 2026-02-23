@@ -46,6 +46,10 @@
 
 -export_type([ticket_store/0, session_ticket/0]).
 
+%% RFC 9001 Section 4.6.1:
+%% For QUIC, max_early_data_size in NewSessionTicket must be 0xffffffff.
+-define(QUIC_MAX_EARLY_DATA_SIZE, 16#FFFFFFFF).
+
 %%====================================================================
 %% Ticket Storage API
 %%====================================================================
@@ -203,9 +207,10 @@ build_new_session_ticket(#session_ticket{
     TicketLen = byte_size(Ticket),
 
     %% Build early_data extension if max_early_data > 0
+    %% QUIC requires the wire value to be 0xffffffff (RFC 9001 Section 4.6.1).
     Extensions = case MaxEarlyData of
         0 -> <<>>;
-        _ -> <<16#00, 16#2a, 4:16, MaxEarlyData:32>>  % early_data extension
+        _ -> <<16#00, 16#2a, 4:16, ?QUIC_MAX_EARLY_DATA_SIZE:32>>  % early_data extension
     end,
     ExtLen = byte_size(Extensions),
 
