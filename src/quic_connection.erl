@@ -1844,9 +1844,9 @@ send_app_packet_internal(Payload, Frames, State) ->
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
     SendResult = gen_udp:send(Socket, IP, Port, Packet),
-    error_logger:info_msg("[QUIC] send_app_packet_internal: PN=~p, PacketSize=~p, "
+    error_logger:info_msg("[QUIC] send_app_packet_internal: PN=~p, PacketSize=~p, DCID=~p, "
                           "Frames=~p, Dest=~p:~p, Result=~p~n",
-                          [PN, PacketSize, Frames, IP, Port, SendResult]),
+                          [PN, PacketSize, DCID, Frames, IP, Port, SendResult]),
 
     %% Track sent packet for loss detection and congestion control
     %% Determine if ack-eliciting (not ACK-only or padding-only)
