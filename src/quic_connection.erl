@@ -1821,12 +1821,6 @@ send_app_packet(Payload, State) when is_binary(Payload) ->
     end,
     send_app_packet_internal(Payload, FrameInfo, State).
 
-%% Send a 1-RTT packet with a single frame (recommended for control frames)
-%% This ensures proper loss tracking for the frame
-send_app_frame(Frame, State) ->
-    Payload = quic_frame:encode(Frame),
-    send_app_packet_internal(Payload, [Frame], State).
-
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
 send_app_packet_internal(Payload, Frames, State) ->
     #state{
@@ -3293,35 +3287,6 @@ is_ack_eliciting_frame({ack, _, _, _}) -> false;
 is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
 is_ack_eliciting_frame(_) -> true.
 
-%% Check if a payload contains ack-eliciting frames
-%% Scans through the entire payload to handle coalesced frames properly.
-%% ACK and PADDING are not ack-eliciting, everything else is.
-%% RFC 9002: A packet is ack-eliciting if it contains at least one ack-eliciting frame.
-is_ack_eliciting_payload(Payload) when is_binary(Payload) ->
-    is_ack_eliciting_payload_scan(Payload).
-
-%% Scan through payload looking for ack-eliciting frames
-%% This handles coalesced packets where ACK+STREAM might be combined
-is_ack_eliciting_payload_scan(<<>>) ->
-    false;
-is_ack_eliciting_payload_scan(<<16#00, Rest/binary>>) ->
-    %% PADDING - skip and continue
-    is_ack_eliciting_payload_scan(Rest);
-is_ack_eliciting_payload_scan(<<Type, _/binary>>) when Type =:= 16#02; Type =:= 16#03 ->
-    %% ACK or ACK_ECN - these frames are variable length, so we can't easily skip them
-    %% However, if we encounter them, we should continue scanning (but this is complex)
-    %% For simplicity, if we see ACK at start, check if there's more data after
-    %% In practice, ACK frames are typically sent alone or with ack-eliciting frames
-    %% Since we can't easily skip variable-length ACK, assume any non-empty payload
-    %% after ACK/PADDING preamble is ack-eliciting
-    true;  % Conservative: assume ack-eliciting if we have data
-is_ack_eliciting_payload_scan(<<Type, _/binary>>) when Type =:= 16#1c; Type =:= 16#1d ->
-    %% CONNECTION_CLOSE - not ack-eliciting
-    false;
-is_ack_eliciting_payload_scan(<<_, _/binary>>) ->
-    %% Any other frame type is ack-eliciting
-    true.
-
 %% Convert ACK ranges from quic_frame format to quic_loss format
 %% Input from quic_frame: [{LargestAcked, FirstRange} | [{Gap, Range}, ...]]
 %% Output for quic_loss: {FirstRange, [{Gap, Range}, ...]}
@@ -3888,40 +3853,6 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
             %% Queue remaining data for later
             QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
             {QueuedState, BytesSentSoFar}  % Return bytes sent so far
-    end.
-
-%% Send stream data in fragments that fit in packets
-%% Respects congestion window by checking before each send
-send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
-    %% Data fits in one packet - check congestion window
-    #state{cc_state = CCState} = State,
-    PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
-
-    case quic_cc:can_send(CCState, PacketSize) of
-        true ->
-            Frame = {stream, StreamId, Offset, Data, Fin},
-            Payload = quic_frame:encode(Frame),
-            send_app_packet_internal(Payload, [Frame], State);
-        false ->
-            %% Queue the data for later sending when cwnd allows
-            queue_stream_data(StreamId, Offset, Data, Fin, State)
-    end;
-send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
-    %% Split data into chunks and send what we can
-    #state{cc_state = CCState} = State,
-    PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
-
-    case quic_cc:can_send(CCState, PacketSize) of
-        true ->
-            <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
-            Frame = {stream, StreamId, Offset, Chunk, false},
-            Payload = quic_frame:encode(Frame),
-            State1 = send_app_packet_internal(Payload, [Frame], State),
-            NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-            send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
-        false ->
-            %% Queue remaining data for later
-            queue_stream_data(StreamId, Offset, Data, Fin, State)
     end.
 
 %% Queue stream data when congestion window is full
