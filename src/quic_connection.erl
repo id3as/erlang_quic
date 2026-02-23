@@ -1973,6 +1973,9 @@ decode_long_header_packet(Data, State) ->
     <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
     <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
 
+    error_logger:info_msg("[QUIC] Long header: DCIDLen=~p, DCID=~p, SCIDLen=~p, SCID=~p~n",
+                          [DCIDLen, DCID, SCIDLen, SCID]),
+
     Type = (FirstByte bsr 4) band 2#11,
 
     case Type of
