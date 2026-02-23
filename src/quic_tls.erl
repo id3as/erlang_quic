@@ -530,10 +530,9 @@ decode_tp_value(Id, Value) when Id =:= ?TP_MAX_IDLE_TIMEOUT;
     %% Known integer parameters are varints
     {Int, _} = quic_varint:decode(Value),
     Int;
-decode_tp_value(Id, Value) ->
+decode_tp_value(_Id, Value) ->
     %% RFC 9000 Section 18: Unknown transport parameters MUST be ignored.
     %% Store raw value to avoid decode errors on unknown/extension parameters.
-    error_logger:info_msg("[QUIC] Unknown transport param ~p, keeping raw value~n", [Id]),
     Value.
 
 %% @doc Decode preferred_address transport parameter (RFC 9000 Section 18.2).

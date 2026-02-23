@@ -146,8 +146,6 @@ on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
     case LargestAckedSentTime > RecoveryStart of
         true ->
             %% Exit recovery - packet sent after recovery started was acked
-            error_logger:info_msg("[QUIC CC] Exiting recovery: largest_acked_sent=~p > recovery_start=~p~n",
-                                  [LargestAckedSentTime, RecoveryStart]),
             %% Now in congestion avoidance, can increase cwnd
             #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
             NewCwnd = case Cwnd < SSThresh of
@@ -164,8 +162,6 @@ on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
             };
         false ->
             %% Still in recovery, don't increase cwnd
-            error_logger:info_msg("[QUIC CC] Still in recovery: largest_acked_sent=~p <= recovery_start=~p~n",
-                                  [LargestAckedSentTime, RecoveryStart]),
             State#cc_state{bytes_in_flight = NewInFlight}
     end;
 on_packets_acked(#cc_state{cwnd = Cwnd, ssthresh = SSThresh,

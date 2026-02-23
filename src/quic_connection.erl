@@ -1444,32 +1444,22 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     end,
 
     %% Build EncryptedExtensions
-    error_logger:info_msg("[QUIC] Building EncExt: ALPN=~p~n", [ALPN]),
-    error_logger:info_msg("[QUIC] TransportParams=~p~n", [TransportParams]),
     EncExtMsg = quic_tls:build_encrypted_extensions(#{
         alpn => ALPN,
         transport_params => TransportParams
     }),
-    error_logger:info_msg("[QUIC] EncExt hex (first 50): ~s~n",
-                          [binary:encode_hex(binary:part(EncExtMsg, 0, min(50, byte_size(EncExtMsg))))]),
 
     %% Build Certificate
     AllCerts = [Cert | CertChain],
     CertMsg = quic_tls:build_certificate(<<>>, AllCerts),
 
-    error_logger:info_msg("[QUIC] TLS msg sizes: EncExt=~p, Cert=~p~n",
-                          [byte_size(EncExtMsg), byte_size(CertMsg)]),
     %% Update transcript after EncryptedExtensions and Certificate
     Transcript1 = <<Transcript/binary, EncExtMsg/binary, CertMsg/binary>>,
     TranscriptHashForCV = quic_crypto:transcript_hash(Cipher, Transcript1),
 
     %% Build CertificateVerify - select signature algorithm based on key type
     SigAlg = select_signature_algorithm(PrivateKey),
-    error_logger:info_msg("[QUIC] CertificateVerify: SigAlg=~p (0x~4.16.0B), KeyType=~p~n",
-                          [SigAlg, SigAlg, element(1, PrivateKey)]),
     CertVerifyMsg = quic_tls:build_certificate_verify(SigAlg, PrivateKey, TranscriptHashForCV),
-    error_logger:info_msg("[QUIC] TLS msg sizes: CertVerify=~p, first_bytes=~p~n",
-                          [byte_size(CertVerifyMsg), binary:encode_hex(binary:part(CertVerifyMsg, 0, min(20, byte_size(CertVerifyMsg))))]),
 
     %% Update transcript after CertificateVerify
     Transcript2 = <<Transcript1/binary, CertVerifyMsg/binary>>,
@@ -1479,44 +1469,22 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     ServerFinishedKey = quic_crypto:derive_finished_key(Cipher, ServerHsSecret),
     ServerVerifyData = quic_crypto:compute_finished_verify(Cipher, ServerFinishedKey, TranscriptHashForFinished),
     FinishedMsg = quic_tls:build_finished(ServerVerifyData),
-    error_logger:info_msg("[QUIC] TLS msg sizes: Finished=~p~n",
-                          [byte_size(FinishedMsg)]),
 
     %% Update transcript after server Finished
     Transcript3 = <<Transcript2/binary, FinishedMsg/binary>>,
     TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript3),
 
-    error_logger:info_msg("[QUIC] Server Finished: verify_data=~p~n",
-                          [binary:encode_hex(ServerVerifyData)]),
-    error_logger:info_msg("[QUIC] Server Finished msg (full): ~p~n",
-                          [binary:encode_hex(FinishedMsg)]),
-    error_logger:info_msg("[QUIC] App key derivation: cipher=~p, transcript_size=~p~n",
-                          [Cipher, byte_size(Transcript3)]),
-    error_logger:info_msg("[QUIC] TranscriptHashFinal=~p~n",
-                          [binary:encode_hex(TranscriptHashFinal)]),
-    error_logger:info_msg("[QUIC] HandshakeSecret=~p~n",
-                          [binary:encode_hex(HandshakeSecret)]),
 
     %% Derive master secret and application keys
     MasterSecret = quic_crypto:derive_master_secret(Cipher, HandshakeSecret),
-    error_logger:info_msg("[QUIC] MasterSecret=~p~n",
-                          [binary:encode_hex(MasterSecret)]),
 
     ClientAppSecret = quic_crypto:derive_client_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
     ServerAppSecret = quic_crypto:derive_server_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
-    error_logger:info_msg("[QUIC] ClientAppSecret=~p~n",
-                          [binary:encode_hex(ClientAppSecret)]),
-    error_logger:info_msg("[QUIC] ServerAppSecret=~p~n",
-                          [binary:encode_hex(ServerAppSecret)]),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
 
-    error_logger:info_msg("[QUIC] Derived app keys: ServerKey=~p, ClientKey=~p~n",
-                          [binary:encode_hex(ServerKey), binary:encode_hex(ClientKey)]),
-    error_logger:info_msg("[QUIC] ServerIV=~p, ClientIV=~p~n",
-                          [binary:encode_hex(ServerIV), binary:encode_hex(ClientIV)]),
 
     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
@@ -1548,7 +1516,6 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
-    error_logger:info_msg("[QUIC] Server sending HANDSHAKE_DONE~n"),
     %% HANDSHAKE_DONE is frame type 0x1e with no payload
     Frame = quic_frame:encode(handshake_done),
     send_app_packet(Frame, State).
@@ -1879,8 +1846,6 @@ send_app_packet_internal(Payload, Frames, State) ->
         server -> ServerKeys
     end,
 
-    error_logger:info_msg("[QUIC] Encrypting: key_prefix=~p, role=~p~n",
-                          [binary:part(EncryptKeys#crypto_keys.key, 0, 4), Role]),
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -1904,28 +1869,16 @@ send_app_packet_internal(Payload, Frames, State) ->
 
     %% Encrypt
     #crypto_keys{key = Key, iv = IV, hp = HP} = EncryptKeys,
-    Nonce = quic_aead:compute_nonce(IV, PN),
-    error_logger:info_msg("[QUIC] Short pkt: PN=~p, IV=~p, Nonce=~p~n",
-                          [PN, binary:encode_hex(IV), binary:encode_hex(Nonce)]),
-    error_logger:info_msg("[QUIC] Short pkt: Key=~p, HP=~p~n",
-                          [binary:encode_hex(Key), binary:encode_hex(HP)]),
-    error_logger:info_msg("[QUIC] Short pkt: Header=~p, AAD=~p~n",
-                          [binary:encode_hex(Header), binary:encode_hex(AAD)]),
     Encrypted = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPayload),
 
     %% Header protection
     PNOffset = byte_size(Header),
     ProtectedHeader = quic_aead:protect_header(HP, <<Header/binary, PNBin/binary>>, Encrypted, PNOffset),
-    error_logger:info_msg("[QUIC] Short pkt: ProtectedHeader=~p~n",
-                          [binary:encode_hex(ProtectedHeader)]),
 
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
     SendResult = gen_udp:send(Socket, IP, Port, Packet),
-    error_logger:info_msg("[QUIC] send_app_packet_internal: PN=~p, PacketSize=~p, DCID=~p, "
-                          "Frames=~p, Dest=~p:~p, Result=~p~n",
-                          [PN, PacketSize, DCID, Frames, IP, Port, SendResult]),
 
     %% Handle send result - only track packet and update state if send succeeded
     case SendResult of
@@ -2065,8 +2018,6 @@ decode_long_header_packet(Data, State) ->
     <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
     <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
 
-    error_logger:info_msg("[QUIC] Long header: DCIDLen=~p, DCID=~p, SCIDLen=~p, SCID=~p~n",
-                          [DCIDLen, DCID, SCIDLen, SCID]),
 
     Type = (FirstByte bsr 4) band 2#11,
 
@@ -2108,15 +2059,10 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     %% - Server: update dcid to client's SCID
     State1 = case State#state.dcid of
         <<>> ->
-            error_logger:info_msg("[QUIC] Setting DCID from peer SCID: ~p~n", [PeerSCID]),
             State#state{dcid = PeerSCID};  % First packet, set DCID
         _ when State#state.dcid =:= State#state.original_dcid ->
-            error_logger:info_msg("[QUIC] Updating DCID from peer SCID: ~p (was ~p)~n",
-                                  [PeerSCID, State#state.dcid]),
             State#state{dcid = PeerSCID};  % Client updates dcid after first server packet
         _ ->
-            error_logger:info_msg("[QUIC] Keeping DCID: ~p (peer SCID was ~p)~n",
-                                  [State#state.dcid, PeerSCID]),
             State  % Already updated
     end,
 
@@ -2282,13 +2228,6 @@ find_matching_reset_token(Token, [_ | Rest]) ->
 
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
-        {CKeys, SKeys} ->
-            error_logger:info_msg("[QUIC] decode_short: ClientKey=~p, ServerKey=~p~n",
-                                  [binary:part(CKeys#crypto_keys.key, 0, 4),
-                                   binary:part(SKeys#crypto_keys.key, 0, 4)]);
-        _ -> ok
-    end,
-    case State#state.app_keys of
         undefined ->
             error_logger:warning_msg("[QUIC] No app keys yet for short header packet~n"),
             %% No app keys yet - check if this might be a stateless reset
@@ -2311,10 +2250,8 @@ decode_short_header_packet(Data, State) ->
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);
                 {ok, Type, Frames, Remaining, NewState} = Result ->
-                    error_logger:info_msg("[QUIC] Short header decrypted OK, frames=~p~n", [Frames]),
                     Result;
                 Other ->
-                    error_logger:info_msg("[QUIC] Short header decrypt result: ~p~n", [Other]),
                     Other
             end
     end.
@@ -2515,8 +2452,6 @@ process_frame(_Level, handshake_done, State) ->
     State;
 
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
-    error_logger:info_msg("[QUIC] Processing STREAM frame: StreamId=~p, Offset=~p, DataSize=~p, Fin=~p~n",
-                          [StreamId, Offset, byte_size(Data), Fin]),
     process_stream_data(StreamId, Offset, Data, Fin, State);
 
 %% MAX_DATA: Peer is increasing connection-level flow control limit
@@ -2525,7 +2460,6 @@ process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
 process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = State) ->
     case MaxData > Current of
         true ->
-            error_logger:info_msg("[QUIC FC] MAX_DATA increased: ~p -> ~p~n", [Current, MaxData]),
             %% Limit increased - try to drain queued data
             State1 = State#state{max_data_remote = MaxData},
             process_send_queue(State1);
@@ -2541,8 +2475,6 @@ process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Str
         {ok, #stream_state{send_max_data = Current} = Stream} ->
             case MaxData > Current of
                 true ->
-                    error_logger:info_msg("[QUIC FC] MAX_STREAM_DATA for stream ~p increased: ~p -> ~p~n",
-                                          [StreamId, Current, MaxData]),
                     NewStream = Stream#stream_state{send_max_data = MaxData},
                     State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
                     %% Limit increased - try to drain queued data
@@ -2560,7 +2492,6 @@ process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Str
 process_frame(_Level, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
     case Max > Current of
         true ->
-            error_logger:info_msg("[QUIC] MAX_STREAMS bidi increased: ~p -> ~p~n", [Current, Max]),
             State#state{max_streams_bidi_remote = Max};
         false ->
             State
@@ -2569,7 +2500,6 @@ process_frame(_Level, {max_streams, bidi, Max}, #state{max_streams_bidi_remote =
 process_frame(_Level, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
     case Max > Current of
         true ->
-            error_logger:info_msg("[QUIC] MAX_STREAMS uni increased: ~p -> ~p~n", [Current, Max]),
             State#state{max_streams_uni_remote = Max};
         false ->
             State
@@ -2606,8 +2536,6 @@ process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, Sta
 %% RFC 9000 Section 19.4
 process_frame(app, {reset_stream, StreamId, ErrorCode, FinalSize},
               #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
-    error_logger:info_msg("[QUIC] Received RESET_STREAM: StreamId=~p, Error=~p, FinalSize=~p~n",
-                          [StreamId, ErrorCode, FinalSize]),
     %% Notify owner of stream reset
     Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
     %% Update stream state to reset
@@ -2632,8 +2560,6 @@ process_frame(app, {reset_stream, StreamId, ErrorCode, FinalSize},
 %% RFC 9000 Section 19.5
 process_frame(app, {stop_sending, StreamId, ErrorCode},
               #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
-    error_logger:info_msg("[QUIC] Received STOP_SENDING: StreamId=~p, Error=~p~n",
-                          [StreamId, ErrorCode]),
     %% Notify owner - they should stop sending and may send RESET_STREAM
     Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
     %% Clear any queued data for this stream and mark as stopped
@@ -2800,8 +2726,6 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Compute shared secret
             SharedSecret = quic_crypto:compute_shared_secret(
                 x25519, ServerPrivKey, ClientPubKey),
-            error_logger:info_msg("[QUIC] ECDH SharedSecret=~p~n",
-                                  [binary:encode_hex(SharedSecret)]),
 
             %% Negotiate ALPN
             ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
@@ -2818,22 +2742,12 @@ process_tls_message(_Level, ?TLS_CLIENT_HELLO, Body, OriginalMsg,
             %% Add ServerHello to transcript
             Transcript = <<Transcript0/binary, ServerHello/binary>>,
             TranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
-            error_logger:info_msg("[QUIC] HS TranscriptHash (CH||SH)=~p~n",
-                                  [binary:encode_hex(TranscriptHash)]),
-            error_logger:info_msg("[QUIC] ClientHello size=~p, ServerHello size=~p~n",
-                                  [byte_size(OriginalMsg), byte_size(ServerHello)]),
 
             %% Derive handshake secrets using already computed early secret
             HandshakeSecret = quic_crypto:derive_handshake_secret(Cipher, EarlySecret, SharedSecret),
-            error_logger:info_msg("[QUIC] Server HandshakeSecret=~p~n",
-                                  [binary:encode_hex(HandshakeSecret)]),
 
             ClientHsSecret = quic_crypto:derive_client_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
             ServerHsSecret = quic_crypto:derive_server_handshake_secret(Cipher, HandshakeSecret, TranscriptHash),
-            error_logger:info_msg("[QUIC] ClientHsSecret=~p~n",
-                                  [binary:encode_hex(ClientHsSecret)]),
-            error_logger:info_msg("[QUIC] ServerHsSecret=~p~n",
-                                  [binary:encode_hex(ServerHsSecret)]),
 
             %% Derive handshake keys
             {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientHsSecret, Cipher),
@@ -3023,7 +2937,6 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     send_handshake_packet(CryptoFrame, State1);
                 false ->
                     %% Verification failed
-                    error_logger:info_msg("[QUIC] Server Finished verification failed~n", []),
                     State
             end;
         {error, _} ->
@@ -3033,7 +2946,6 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
 %% Server receives client's Finished
 process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     #state{role = server, tls_state = ?TLS_AWAITING_CLIENT_FINISHED} = State) ->
-    error_logger:info_msg("[QUIC] Server received client Finished~n"),
     {ClientHsKeys, _} = State#state.handshake_keys,
     Cipher = ClientHsKeys#crypto_keys.cipher,
 
@@ -3067,7 +2979,6 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State2);
                 false ->
-                    error_logger:info_msg("[QUIC] Client Finished verification failed~n", []),
                     State
             end;
         {error, _} ->
@@ -3177,8 +3088,6 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
         error ->
             %% New stream from peer - use peer's limits for streams they initiate
             SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
-            error_logger:info_msg("[QUIC] New peer-initiated stream ~p with send_max_data=~p~n",
-                                  [StreamId, SendMaxData]),
             {#stream_state{
                 id = StreamId,
                 state = open,
@@ -3513,11 +3422,9 @@ check_state_transition(CurrentState, State) ->
     case State#state.close_reason of
         connection_closed ->
             %% Peer sent CONNECTION_CLOSE, transition to draining
-            error_logger:info_msg("[QUIC] Peer sent CONNECTION_CLOSE, transitioning to draining~n"),
             {next_state, draining, State};
         stateless_reset ->
             %% Received stateless reset, transition to draining
-            error_logger:info_msg("[QUIC] Received stateless reset, transitioning to draining~n"),
             {next_state, draining, State};
         _ ->
             %% Check for TLS handshake state transitions
@@ -3668,8 +3575,6 @@ do_open_stream(#state{role = Role, next_stream_id_bidi = NextId,
                 recv_buffer = #{},
                 final_size = undefined
             },
-            error_logger:info_msg("[QUIC] Opened bidi stream ~p with send_max_data=~p~n",
-                                  [NextId, SendMaxData]),
             NewState = State#state{
                 next_stream_id_bidi = NextId + 4,
                 streams = maps:put(NextId, StreamState, Streams)
@@ -3709,8 +3614,6 @@ do_open_unidirectional_stream(#state{role = Role, next_stream_id_uni = NextId,
                 recv_buffer = #{},
                 final_size = undefined
             },
-            error_logger:info_msg("[QUIC] Opened uni stream ~p with send_max_data=~p~n",
-                                  [NextId, SendMaxData]),
             NewState = State#state{
                 next_stream_id_uni = NextId + 4,
                 streams = maps:put(NextId, StreamState, Streams)
@@ -3792,12 +3695,6 @@ do_send_data(StreamId, Data, Fin, #state{streams = Streams,
                     StreamAllowed = SendMaxData - Offset,
 
                     %% Log flow control status
-                    error_logger:info_msg("[QUIC FC] Stream ~p: data_size=~p, "
-                                          "conn_allowed=~p (max=~p, sent=~p), "
-                                          "stream_allowed=~p (max=~p, offset=~p)~n",
-                                          [StreamId, DataSize, ConnectionAllowed,
-                                           MaxDataRemote, DataSent, StreamAllowed,
-                                           SendMaxData, Offset]),
 
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
                         {false, _} ->
@@ -3970,7 +3867,6 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
             {NewState, BytesSentSoFar + byte_size(Data)};
         false ->
             %% Queue the data for later sending when cwnd allows
-            error_logger:warning_msg("[QUIC CC] QUEUING data for StreamId=~p due to congestion~n", [StreamId]),
             QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
             {QueuedState, BytesSentSoFar}  % Return bytes sent so far, not including queued
     end;
@@ -3990,7 +3886,6 @@ send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSen
             send_stream_data_fragmented_tracked(StreamId, NewOffset, Rest, Fin, State1, NewBytesSent);
         false ->
             %% Queue remaining data for later
-            error_logger:warning_msg("[QUIC CC] QUEUING remaining data for StreamId=~p due to congestion~n", [StreamId]),
             QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
             {QueuedState, BytesSentSoFar}  % Return bytes sent so far
     end.
@@ -4001,36 +3896,22 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(D
     %% Data fits in one packet - check congestion window
     #state{cc_state = CCState} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
-    Cwnd = quic_cc:cwnd(CCState),
-    InFlight = quic_cc:bytes_in_flight(CCState),
-    error_logger:info_msg("[QUIC CC] send_stream_data_fragmented: StreamId=~p, DataSize=~p, PacketSize=~p, "
-                          "can_send=~p, cwnd=~p, bytes_in_flight=~p~n",
-                          [StreamId, byte_size(Data), PacketSize, CanSend, Cwnd, InFlight]),
 
-    case CanSend of
+    case quic_cc:can_send(CCState, PacketSize) of
         true ->
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode(Frame),
             send_app_packet_internal(Payload, [Frame], State);
         false ->
             %% Queue the data for later sending when cwnd allows
-            error_logger:warning_msg("[QUIC CC] QUEUING data for StreamId=~p due to congestion (cwnd=~p, in_flight=~p)~n",
-                                     [StreamId, Cwnd, InFlight]),
             queue_stream_data(StreamId, Offset, Data, Fin, State)
     end;
 send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
     %% Split data into chunks and send what we can
     #state{cc_state = CCState} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
-    CanSend = quic_cc:can_send(CCState, PacketSize),
-    Cwnd = quic_cc:cwnd(CCState),
-    InFlight = quic_cc:bytes_in_flight(CCState),
-    error_logger:info_msg("[QUIC CC] send_stream_data_fragmented (large): StreamId=~p, TotalSize=~p, PacketSize=~p, "
-                          "can_send=~p, cwnd=~p, bytes_in_flight=~p~n",
-                          [StreamId, byte_size(Data), PacketSize, CanSend, Cwnd, InFlight]),
 
-    case CanSend of
+    case quic_cc:can_send(CCState, PacketSize) of
         true ->
             <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
             Frame = {stream, StreamId, Offset, Chunk, false},
@@ -4040,8 +3921,6 @@ send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
             send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
         false ->
             %% Queue remaining data for later
-            error_logger:warning_msg("[QUIC CC] QUEUING large data for StreamId=~p due to congestion (cwnd=~p, in_flight=~p)~n",
-                                     [StreamId, Cwnd, InFlight]),
             queue_stream_data(StreamId, Offset, Data, Fin, State)
     end.
 
@@ -4761,7 +4640,7 @@ retire_peer_cids(_RetirePrior, State) ->
 %% @doc Apply peer transport parameters to connection state.
 %% Extracts flow control limits, stream limits, and CID limit from peer's transport params.
 %% RFC 9000 Section 7.4: Transport parameters are applied after the handshake completes.
-apply_peer_transport_params(TransportParams, #state{role = Role} = State) ->
+apply_peer_transport_params(TransportParams, State) ->
     %% Extract peer's active_connection_id_limit (default: 2 per RFC 9000)
     PeerCIDLimit = maps:get(active_connection_id_limit, TransportParams, 2),
 
@@ -4784,12 +4663,6 @@ apply_peer_transport_params(TransportParams, #state{role = Role} = State) ->
     MaxStreamsBidi = maps:get(initial_max_streams_bidi, TransportParams, ?DEFAULT_MAX_STREAMS_BIDI),
     MaxStreamsUni = maps:get(initial_max_streams_uni, TransportParams, ?DEFAULT_MAX_STREAMS_UNI),
 
-    error_logger:info_msg("[QUIC] Applied peer transport params: max_data=~p, "
-                          "max_stream_data_bidi_remote=~p, max_stream_data_bidi_local=~p, "
-                          "max_stream_data_uni=~p, max_streams_bidi=~p, max_streams_uni=~p, "
-                          "peer_cid_limit=~p, role=~p~n",
-                          [MaxDataRemote, MaxStreamDataBidiRemote, MaxStreamDataBidiLocal,
-                           MaxStreamDataUni, MaxStreamsBidi, MaxStreamsUni, PeerCIDLimit, Role]),
 
     %% Store stream data limits in state for use when opening streams
     %% These tell us how much we can send on different stream types
