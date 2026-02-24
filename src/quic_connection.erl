@@ -71,6 +71,7 @@
     sockname/1,
     peercert/1,
     set_owner/2,
+    set_owner_sync/2,
     setopts/2,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
@@ -425,10 +426,16 @@ sockname(Conn) ->
 peercert(Conn) ->
     gen_statem:call(Conn, peercert).
 
-%% @doc Set new owner process.
+%% @doc Set new owner process (async).
 -spec set_owner(pid(), pid()) -> ok.
 set_owner(Conn, NewOwner) ->
     gen_statem:cast(Conn, {set_owner, NewOwner}).
+
+%% @doc Set new owner process (sync).
+%% Blocks until ownership is transferred.
+-spec set_owner_sync(pid(), pid()) -> ok.
+set_owner_sync(Conn, NewOwner) ->
+    gen_statem:call(Conn, {set_owner, NewOwner}).
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
@@ -770,6 +777,9 @@ idle({call, From}, peername, #state{remote_addr = Addr} = State) ->
 idle({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
 
+idle({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
+
 idle(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
 
@@ -839,6 +849,9 @@ handshaking({call, From}, peername, #state{remote_addr = Addr} = State) ->
 
 handshaking({call, From}, sockname, #state{local_addr = Addr} = State) ->
     {keep_state, State, [{reply, From, {ok, Addr}}]};
+
+handshaking({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
 
 handshaking(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
@@ -949,6 +962,9 @@ connected({call, From}, peercert, #state{peer_cert = undefined} = State) ->
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{peer_cert = Cert} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
+
+connected({call, From}, {set_owner, NewOwner}, State) ->
+    {keep_state, State#state{owner = NewOwner}, [{reply, From, ok}]};
 
 connected(cast, {set_owner, NewOwner}, State) ->
     {keep_state, State#state{owner = NewOwner}};
@@ -1243,9 +1259,13 @@ send_client_hello(State) ->
     NewState.
 
 %% Server: Select cipher suite from client's list (server preference)
+%% ClientCipherSuites is a list of TLS cipher suite codes (integers)
+%% Convert to atoms for internal use
 select_cipher(ClientCipherSuites) ->
+    %% Convert client's cipher suite codes to atoms
+    ClientCiphers = [cipher_code_to_atom(C) || C <- ClientCipherSuites],
     ServerPreference = [aes_128_gcm, aes_256_gcm, chacha20_poly1305],
-    select_first_match(ServerPreference, ClientCipherSuites).
+    select_first_match(ServerPreference, ClientCiphers).
 
 select_first_match([], _) -> aes_128_gcm;  % Default
 select_first_match([Cipher | Rest], ClientSuites) ->
@@ -1253,6 +1273,12 @@ select_first_match([Cipher | Rest], ClientSuites) ->
         true -> Cipher;
         false -> select_first_match(Rest, ClientSuites)
     end.
+
+%% Convert TLS cipher suite code to internal atom
+cipher_code_to_atom(?TLS_AES_128_GCM_SHA256) -> aes_128_gcm;
+cipher_code_to_atom(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
+cipher_code_to_atom(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
+cipher_code_to_atom(_) -> unknown.
 
 %% Server: Negotiate ALPN
 negotiate_alpn(ClientALPN, ServerALPN) ->
@@ -1448,14 +1474,17 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     Transcript3 = <<Transcript2/binary, FinishedMsg/binary>>,
     TranscriptHashFinal = quic_crypto:transcript_hash(Cipher, Transcript3),
 
+
     %% Derive master secret and application keys
     MasterSecret = quic_crypto:derive_master_secret(Cipher, HandshakeSecret),
+
     ClientAppSecret = quic_crypto:derive_client_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
     ServerAppSecret = quic_crypto:derive_server_app_secret(Cipher, MasterSecret, TranscriptHashFinal),
 
     %% Derive app keys
     {ClientKey, ClientIV, ClientHP} = quic_keys:derive_keys(ClientAppSecret, Cipher),
     {ServerKey, ServerIV, ServerHP} = quic_keys:derive_keys(ServerAppSecret, Cipher),
+
 
     ClientAppKeys = #crypto_keys{key = ClientKey, iv = ClientIV, hp = ClientHP, cipher = Cipher},
     ServerAppKeys = #crypto_keys{key = ServerKey, iv = ServerIV, hp = ServerHP, cipher = Cipher},
@@ -1673,15 +1702,24 @@ dequeue_small_stream_frame(#state{send_queue = PQ} = State) ->
 send_coalesced_frames(Frames, State) ->
     Payload = iolist_to_binary(Frames),
     %% Extract decoded frame info for loss tracking
-    FrameInfo = lists:map(fun decode_frame_for_tracking/1, Frames),
+    %% Filter out unknown frames to avoid issues with retransmission
+    FrameInfo = lists:filtermap(fun decode_frame_for_tracking/1, Frames),
     send_app_packet_internal(Payload, FrameInfo, State).
 
 %% Extract frame info for loss detection tracking
-decode_frame_for_tracking(FrameBin) ->
+%% Returns {true, Frame} for valid frames, false for unknown/failed decodes
+decode_frame_for_tracking(FrameBin) when is_binary(FrameBin) ->
     case quic_frame:decode(FrameBin) of
-        {ok, Frame, _} -> Frame;
-        _ -> unknown
-    end.
+        {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> {true, Frame};
+        {error, _} ->
+            %% Log but don't include unknown frames in tracking
+            error_logger:warning_msg("[QUIC] Failed to decode frame for tracking: ~p~n",
+                                     [FrameBin]),
+            false
+    end;
+decode_frame_for_tracking(_) ->
+    %% Non-binary input, skip
+    false.
 
 %% Build an ACK frame from ranges
 %% Our internal format is [{Start, End}, ...] where Start <= End
@@ -1773,9 +1811,15 @@ send_handshake_packet(Payload, State) ->
     NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
     State#state{pn_handshake = NewPNSpace}.
 
-%% Send a 1-RTT (application) packet (without tracking frames for retransmission)
-send_app_packet(Payload, State) ->
-    send_app_packet_internal(Payload, [], State).
+%% Send a 1-RTT (application) packet with frame for retransmission tracking
+%% Decodes the payload to extract frame info for loss tracking
+send_app_packet(Payload, State) when is_binary(Payload) ->
+    %% Try to decode the frame for proper loss tracking
+    FrameInfo = case quic_frame:decode(Payload) of
+        {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> [Frame];
+        _ -> []  % Fall back to empty if decode fails
+    end,
+    send_app_packet_internal(Payload, FrameInfo, State).
 
 %% Send a 1-RTT packet with explicit frames list for retransmission tracking
 send_app_packet_internal(Payload, Frames, State) ->
@@ -1795,6 +1839,7 @@ send_app_packet_internal(Payload, Frames, State) ->
         client -> ClientKeys;
         server -> ServerKeys
     end,
+
 
     PN = PNSpace#pn_space.next_pn,
     PNLen = quic_packet:pn_length(PN),
@@ -1827,27 +1872,40 @@ send_app_packet_internal(Payload, Frames, State) ->
     %% Build and send
     Packet = <<ProtectedHeader/binary, Encrypted/binary>>,
     PacketSize = byte_size(Packet),
-    gen_udp:send(Socket, IP, Port, Packet),
+    SendResult = gen_udp:send(Socket, IP, Port, Packet),
 
-    %% Track sent packet for loss detection and congestion control
-    %% Determine if ack-eliciting (not ACK-only or padding-only)
-    AckEliciting = is_ack_eliciting_payload(Payload),
-    NewLossState = quic_loss:on_packet_sent(LossState, PN, PacketSize, AckEliciting, Frames),
-    NewCCState = case AckEliciting of
-        true -> quic_cc:on_packet_sent(CCState, PacketSize);
-        false -> CCState
-    end,
+    %% Handle send result - only track packet and update state if send succeeded
+    case SendResult of
+        ok ->
+            %% Track sent packet for loss detection and congestion control
+            %% Determine if ack-eliciting by checking the actual frames list
+            %% This properly handles coalesced packets with multiple frames
+            AckEliciting = contains_ack_eliciting_frames(Frames),
+            NewLossState = quic_loss:on_packet_sent(LossState, PN, PacketSize, AckEliciting, Frames),
+            NewCCState = case AckEliciting of
+                true -> quic_cc:on_packet_sent(CCState, PacketSize);
+                false -> CCState
+            end,
 
-    %% Update PN space
-    NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
-    State1 = State#state{
-        pn_app = NewPNSpace,
-        cc_state = NewCCState,
-        loss_state = NewLossState
-    },
+            %% Update PN space
+            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+            State1 = State#state{
+                pn_app = NewPNSpace,
+                cc_state = NewCCState,
+                loss_state = NewLossState
+            },
 
-    %% Set PTO timer for retransmission
-    set_pto_timer(State1).
+            %% Set PTO timer for retransmission
+            set_pto_timer(State1);
+        {error, Reason} ->
+            %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
+            %% The data will be re-sent via the PTO timeout mechanism
+            error_logger:warning_msg("[QUIC] UDP send failed: ~p (PN=~p, size=~p)~n",
+                                     [Reason, PN, PacketSize]),
+            %% Still bump PN to avoid reusing packet numbers
+            NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
+            State#state{pn_app = NewPNSpace}
+    end.
 
 %% Pad Initial packet to minimum 1200 bytes
 pad_initial_packet(Packet) when byte_size(Packet) >= 1200 ->
@@ -1954,6 +2012,7 @@ decode_long_header_packet(Data, State) ->
     <<DCID:DCIDLen/binary, SCIDLen, Rest2/binary>> = Rest,
     <<SCID:SCIDLen/binary, Rest3/binary>> = Rest2,
 
+
     Type = (FirstByte bsr 4) band 2#11,
 
     case Type of
@@ -1993,10 +2052,12 @@ decode_initial_packet(FullPacket, FirstByte, _DCID, PeerSCID, Rest, State) ->
     %% - Client: update dcid to server's SCID
     %% - Server: update dcid to client's SCID
     State1 = case State#state.dcid of
-        <<>> -> State#state{dcid = PeerSCID};  % First packet, set DCID
+        <<>> ->
+            State#state{dcid = PeerSCID};  % First packet, set DCID
         _ when State#state.dcid =:= State#state.original_dcid ->
             State#state{dcid = PeerSCID};  % Client updates dcid after first server packet
-        _ -> State  % Already updated
+        _ ->
+            State  % Already updated
     end,
 
     %% Ensure we have enough data
@@ -2162,6 +2223,7 @@ find_matching_reset_token(Token, [_ | Rest]) ->
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
+            error_logger:warning_msg("[QUIC] No app keys yet for short header packet~n"),
             %% No app keys yet - check if this might be a stateless reset
             check_stateless_reset(Data, State);
         {ClientKeys, ServerKeys} ->
@@ -2177,11 +2239,14 @@ decode_short_header_packet(Data, State) ->
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
             case decrypt_app_packet(Header, EncryptedPayload, DecryptKeys, State) of
-                {error, decryption_failed} ->
+                {error, decryption_failed} = Err ->
+                    error_logger:warning_msg("[QUIC] Short header decryption failed~n"),
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);
-                Result ->
-                    Result
+                {ok, Type, Frames, Remaining, NewState} = Result ->
+                    Result;
+                Other ->
+                    Other
             end
     end.
 
@@ -2316,15 +2381,34 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             AckFrame = {ack, LargestAcked, AckDelay, FirstRange, RestRanges},
 
             Now = erlang:monotonic_time(millisecond),
-            {NewLossState, AckedPackets, LostPackets} =
-                quic_loss:on_ack_received(LossState, AckFrame, Now),
+            case quic_loss:on_ack_received(LossState, AckFrame, Now) of
+                {error, ack_range_too_large} ->
+                    %% RFC 9000: Invalid ACK range is a protocol violation
+                    error_logger:error_msg("[QUIC] Invalid ACK range received, ignoring~n"),
+                    State;
+                {NewLossState, AckedPackets, LostPackets} ->
 
             %% Calculate total bytes acked and lost
             AckedBytes = lists:sum([P#sent_packet.size || P <- AckedPackets]),
             LostBytes = lists:sum([P#sent_packet.size || P <- LostPackets]),
 
-            %% Update congestion control
-            CCState1 = quic_cc:on_packets_acked(CCState, AckedBytes),
+            %% Find the largest acked packet's sent time for recovery exit detection
+            LargestAckedSentTime = case AckedPackets of
+                [] -> Now;
+                _ ->
+                    %% AckedPackets may not be sorted, find the one with largest PN
+                    LargestAckedPkt = lists:foldl(
+                        fun(P, Acc) ->
+                            case P#sent_packet.pn > Acc#sent_packet.pn of
+                                true -> P;
+                                false -> Acc
+                            end
+                        end, hd(AckedPackets), tl(AckedPackets)),
+                    LargestAckedPkt#sent_packet.time_sent
+            end,
+
+            %% Update congestion control with largest acked sent time for proper recovery exit
+            CCState1 = quic_cc:on_packets_acked(CCState, AckedBytes, LargestAckedSentTime),
             CCState2 = quic_cc:on_packets_lost(CCState1, LostBytes),
 
             %% If there was loss, signal congestion event
@@ -2354,7 +2438,8 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
 
             %% Try to send queued data now that cwnd may have freed up
             process_send_queue(State3)
-    end;
+            end  %% close inner case (on_ack_received)
+    end;  %% close outer case (Ranges)
 
 process_frame(_Level, handshake_done, State) ->
     %% Server confirmed handshake complete
@@ -2363,23 +2448,56 @@ process_frame(_Level, handshake_done, State) ->
 process_frame(app, {stream, StreamId, Offset, Data, Fin}, State) ->
     process_stream_data(StreamId, Offset, Data, Fin, State);
 
-process_frame(_Level, {max_data, MaxData}, State) ->
-    State#state{max_data_remote = MaxData};
+%% MAX_DATA: Peer is increasing connection-level flow control limit
+%% RFC 9000 Section 19.9: The max_data field is an unsigned integer indicating the maximum
+%% amount of data that can be sent on the entire connection. This value MUST be >= previous.
+process_frame(_Level, {max_data, MaxData}, #state{max_data_remote = Current} = State) ->
+    case MaxData > Current of
+        true ->
+            %% Limit increased - try to drain queued data
+            State1 = State#state{max_data_remote = MaxData},
+            process_send_queue(State1);
+        false ->
+            %% Monotonic: ignore if not increasing (per RFC 9000)
+            State
+    end;
 
-process_frame(_Level, {max_stream_data, StreamId, MaxData}, State) ->
-    case maps:find(StreamId, State#state.streams) of
-        {ok, Stream} ->
-            NewStream = Stream#stream_state{send_max_data = MaxData},
-            State#state{streams = maps:put(StreamId, NewStream, State#state.streams)};
+%% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
+%% RFC 9000 Section 19.10: Receiving MAX_STREAM_DATA for a send-only stream is an error.
+process_frame(_Level, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream_state{send_max_data = Current} = Stream} ->
+            case MaxData > Current of
+                true ->
+                    NewStream = Stream#stream_state{send_max_data = MaxData},
+                    State1 = State#state{streams = maps:put(StreamId, NewStream, Streams)},
+                    %% Limit increased - try to drain queued data
+                    process_send_queue(State1);
+                false ->
+                    %% Monotonic: ignore if not increasing
+                    State
+            end;
         error ->
             State
     end;
 
-process_frame(_Level, {max_streams, bidi, Max}, State) ->
-    State#state{max_streams_bidi_remote = Max};
+%% MAX_STREAMS: Peer is increasing the number of streams we can open
+%% RFC 9000 Section 19.11: The value MUST be >= previous value
+process_frame(_Level, {max_streams, bidi, Max}, #state{max_streams_bidi_remote = Current} = State) ->
+    case Max > Current of
+        true ->
+            State#state{max_streams_bidi_remote = Max};
+        false ->
+            State
+    end;
 
-process_frame(_Level, {max_streams, uni, Max}, State) ->
-    State#state{max_streams_uni_remote = Max};
+process_frame(_Level, {max_streams, uni, Max}, #state{max_streams_uni_remote = Current} = State) ->
+    case Max > Current of
+        true ->
+            State#state{max_streams_uni_remote = Max};
+        false ->
+            State
+    end;
 
 %% PATH_CHALLENGE: Peer is probing the path, respond with PATH_RESPONSE
 process_frame(app, {path_challenge, ChallengeData}, State) ->
@@ -2408,6 +2526,50 @@ process_frame(app, {retire_connection_id, SeqNum}, State) ->
 process_frame(_Level, {connection_close, _Type, _Code, _FrameType, _Reason}, State) ->
     State#state{close_reason = connection_closed};
 
+%% RESET_STREAM: Peer is aborting a stream they initiated or we initiated for sending
+%% RFC 9000 Section 19.4
+process_frame(app, {reset_stream, StreamId, ErrorCode, FinalSize},
+              #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
+    %% Notify owner of stream reset
+    Owner ! {quic, Ref, {stream_reset, StreamId, ErrorCode}},
+    %% Update stream state to reset
+    NewStreams = case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            %% Mark stream as reset, store final size for flow control accounting
+            maps:put(StreamId, Stream#stream_state{
+                state = reset,
+                final_size = FinalSize
+            }, Streams);
+        error ->
+            %% Unknown stream - create minimal state to track reset
+            maps:put(StreamId, #stream_state{
+                id = StreamId,
+                state = reset,
+                final_size = FinalSize
+            }, Streams)
+    end,
+    State#state{streams = NewStreams};
+
+%% STOP_SENDING: Peer wants us to stop sending on a stream
+%% RFC 9000 Section 19.5
+process_frame(app, {stop_sending, StreamId, ErrorCode},
+              #state{owner = Owner, conn_ref = Ref, streams = Streams} = State) ->
+    %% Notify owner - they should stop sending and may send RESET_STREAM
+    Owner ! {quic, Ref, {stop_sending, StreamId, ErrorCode}},
+    %% Clear any queued data for this stream and mark as stopped
+    NewStreams = case maps:find(StreamId, Streams) of
+        {ok, Stream} ->
+            maps:put(StreamId, Stream#stream_state{
+                state = stopped,
+                send_buffer = []  % Clear queued data
+            }, Streams);
+        error ->
+            Streams
+    end,
+    %% Also remove from send queue
+    NewSendQueue = remove_stream_from_queue(StreamId, State#state.send_queue),
+    State#state{streams = NewStreams, send_queue = NewSendQueue};
+
 %% DATAGRAM frames (RFC 9221)
 process_frame(app, {datagram, Data}, #state{owner = Owner, conn_ref = Ref} = State) ->
     Owner ! {quic, Ref, {datagram, Data}},
@@ -2419,6 +2581,14 @@ process_frame(app, {datagram_with_length, Data}, #state{owner = Owner, conn_ref 
 process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
+
+%% Helper to remove a stream from the send queue (tuple of 8 queues)
+remove_stream_from_queue(StreamId, PQ) ->
+    %% Filter out entries for this stream from all 8 priority buckets
+    %% Queue entries are 5-tuples: {stream_data, StreamId, Offset, Data, Fin}
+    list_to_tuple([
+        queue:filter(fun({stream_data, SId, _, _, _}) -> SId =/= StreamId end, element(I, PQ))
+    || I <- lists:seq(1, 8)]).
 
 %% Buffer CRYPTO data and process when complete messages are available
 buffer_crypto_data(Level, Offset, Data, State) ->
@@ -2761,7 +2931,6 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     send_handshake_packet(CryptoFrame, State1);
                 false ->
                     %% Verification failed
-                    error_logger:info_msg("[QUIC] Server Finished verification failed~n", []),
                     State
             end;
         {error, _} ->
@@ -2804,7 +2973,6 @@ process_tls_message(_Level, ?TLS_FINISHED, Body, OriginalMsg,
                     %% Send NewSessionTicket to enable session resumption
                     send_new_session_ticket(State2);
                 false ->
-                    error_logger:info_msg("[QUIC] Client Finished verification failed~n", []),
                     State
             end;
         {error, _} ->
@@ -2875,102 +3043,161 @@ process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
 %%====================================================================
 
 process_stream_data(StreamId, Offset, Data, Fin, State) ->
-    #state{owner = Owner, conn_ref = Ref, streams = Streams} = State,
+    #state{owner = Owner, conn_ref = Ref, streams = Streams, role = Role} = State,
+
+    %% RFC 9000 Section 2.1: Validate stream direction
+    %% Cannot receive on locally-initiated unidirectional streams
+    case validate_receive_stream(StreamId, Role) of
+        {error, Reason} ->
+            error_logger:warning_msg("[QUIC] Invalid receive stream ~p: ~p~n", [StreamId, Reason]),
+            State;  % Silently ignore (could send STREAM_STATE_ERROR)
+        ok ->
+            process_stream_data_validated(StreamId, Offset, Data, Fin, State)
+    end.
+
+%% Validate that we can receive on this stream
+validate_receive_stream(StreamId, Role) ->
+    IsUni = (StreamId band 2) =/= 0,
+    IsLocallyInitiated = case Role of
+        client -> (StreamId band 1) =:= 0;
+        server -> (StreamId band 1) =:= 1
+    end,
+    case {IsUni, IsLocallyInitiated} of
+        {true, true} ->
+            %% Cannot receive on our own unidirectional stream
+            {error, stream_state_error};
+        _ ->
+            ok
+    end.
+
+process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
+    #state{owner = Owner, conn_ref = Ref, streams = Streams,
+           max_data_local = MaxDataLocal, data_received = DataReceived} = State,
+
+    DataSize = byte_size(Data),
 
     %% Get or create stream state
-    Stream = case maps:find(StreamId, Streams) of
-        {ok, S} -> S;
+    {Stream, IsNew} = case maps:find(StreamId, Streams) of
+        {ok, S} -> {S, false};
         error ->
-            %% New stream from server
-            #stream_state{
+            %% New stream from peer - use peer's limits for streams they initiate
+            SendMaxData = get_peer_stream_limit(bidi_peer_initiated, State),
+            {#stream_state{
                 id = StreamId,
                 state = open,
                 send_offset = 0,
-                send_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                send_max_data = SendMaxData,
                 send_fin = false,
                 send_buffer = [],
                 recv_offset = 0,
                 recv_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
                 recv_fin = false,
-                recv_buffer = #{},  %% Map for out-of-order reassembly
+                recv_buffer = #{},
                 final_size = undefined
-            }
+            }, true}
     end,
 
-    %% Store data in buffer at its offset (handles duplicates gracefully)
-    RecvBuffer = case Stream#stream_state.recv_buffer of
-        B when is_map(B) -> B;
-        _ -> #{}  %% Upgrade old binary buffer format
-    end,
-    UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
-
-    %% Track FIN position if received
-    FinalSize = case Fin of
-        true -> Offset + byte_size(Data);
-        false -> Stream#stream_state.final_size
-    end,
-
-    %% Extract contiguous data starting from recv_offset and deliver it
-    CurrentOffset = Stream#stream_state.recv_offset,
-    {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(UpdatedBuffer, CurrentOffset),
-
-    %% Determine if we should deliver FIN (all data up to FIN has been delivered)
-    DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
-
-    %% Deliver contiguous data to owner (may be empty if out-of-order)
-    case DeliverData of
-        <<>> ->
-            ok;  %% No contiguous data to deliver yet
-        _ ->
-            Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
-    end,
-
-    NewStream = Stream#stream_state{
-        recv_offset = NewRecvOffset,
-        recv_fin = DeliverFin,
-        recv_buffer = NewBuffer,
-        final_size = FinalSize
-    },
-
-    %% Track connection-level data received (RFC 9000 Section 4.1)
-    DataSize = byte_size(Data),
-    NewDataReceived = State#state.data_received + DataSize,
-    State1 = State#state{
-        streams = maps:put(StreamId, NewStream, Streams),
-        data_received = NewDataReceived
-    },
-
-    %% Check if we need to send MAX_STREAM_DATA to allow more data
-    %% Send when we've consumed more than half our advertised limit
+    %% RFC 9000 Section 4.1: Check receive flow control limits BEFORE buffering
+    EndOffset = Offset + DataSize,
     RecvMaxData = Stream#stream_state.recv_max_data,
-    State2 = case NewRecvOffset > (RecvMaxData div 2) of
-        true ->
-            %% Double the limit and send MAX_STREAM_DATA
-            NewMaxStreamData = RecvMaxData * 2,
-            UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
-            MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxStreamData}),
-            State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
-            send_app_packet(MaxStreamDataFrame, State1a);
-        false ->
-            State1
-    end,
+    case {EndOffset > RecvMaxData, DataReceived + DataSize > MaxDataLocal} of
+        {true, _} ->
+            %% Stream-level flow control violation
+            error_logger:warning_msg("[QUIC FC] Stream ~p flow control violation: end=~p > max=~p~n",
+                                     [StreamId, EndOffset, RecvMaxData]),
+            State;  % Could send FLOW_CONTROL_ERROR
+        {_, true} ->
+            %% Connection-level flow control violation
+            error_logger:warning_msg("[QUIC FC] Connection flow control violation: recv=~p > max=~p~n",
+                                     [DataReceived + DataSize, MaxDataLocal]),
+            State;  % Could send FLOW_CONTROL_ERROR
+        _ ->
+            %% Flow control OK - proceed with buffering
+            RecvBuffer = case Stream#stream_state.recv_buffer of
+                B when is_map(B) -> B;
+                _ -> #{}
+            end,
 
-    %% Check if we need to send MAX_DATA for connection-level flow control
-    %% Send when we've consumed more than 50% of our advertised connection window
-    MaxDataLocal = State2#state.max_data_local,
-    State3 = case NewDataReceived > (MaxDataLocal div 2) of
-        true ->
-            %% Extend the connection-level window and send MAX_DATA
-            NewMaxData = NewDataReceived + MaxDataLocal,
-            MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
-            State2a = send_app_packet(MaxDataFrame, State2),
-            State2a#state{max_data_local = NewMaxData};
-        false ->
-            State2
-    end,
+            %% Check if this is duplicate data (already have data at this offset)
+            CurrentOffset = Stream#stream_state.recv_offset,
+            IsDuplicate = Offset < CurrentOffset orelse maps:is_key(Offset, RecvBuffer),
 
-    %% ACK is sent at packet level by maybe_send_ack
-    State3.
+            %% Store data in buffer (handles duplicates gracefully - overwrites)
+            UpdatedBuffer = maps:put(Offset, Data, RecvBuffer),
+
+            %% Track FIN position if received
+            FinalSize = case Fin of
+                true -> EndOffset;
+                false -> Stream#stream_state.final_size
+            end,
+
+            %% Extract contiguous data starting from recv_offset and deliver it
+            {DeliverData, NewRecvOffset, NewBuffer} = extract_contiguous_data(UpdatedBuffer, CurrentOffset),
+
+            %% Determine if we should deliver FIN (all data up to FIN has been delivered)
+            DeliverFin = FinalSize =/= undefined andalso NewRecvOffset >= FinalSize,
+
+            %% Deliver contiguous data to owner
+            %% RFC 9000: Also deliver FIN-only notification when no data but FIN received
+            case {DeliverData, DeliverFin, Fin} of
+                {<<>>, false, _} ->
+                    ok;  %% No contiguous data to deliver yet
+                {<<>>, true, _} ->
+                    %% FIN-only delivery (all data already delivered)
+                    Owner ! {quic, Ref, {stream_data, StreamId, <<>>, true}};
+                {_, _, _} ->
+                    Owner ! {quic, Ref, {stream_data, StreamId, DeliverData, DeliverFin}}
+            end,
+
+            NewStream = Stream#stream_state{
+                recv_offset = NewRecvOffset,
+                recv_fin = DeliverFin,
+                recv_buffer = NewBuffer,
+                final_size = FinalSize
+            },
+
+            %% Track connection-level data received - only count NEW bytes, not duplicates
+            NewBytesReceived = case IsDuplicate of
+                true -> 0;
+                false -> DataSize
+            end,
+            NewDataReceivedVal = DataReceived + NewBytesReceived,
+            State1 = State#state{
+                streams = maps:put(StreamId, NewStream, Streams),
+                data_received = NewDataReceivedVal
+            },
+
+            %% Check if we need to send MAX_STREAM_DATA to allow more data
+            %% Send when we've consumed more than half our advertised limit
+            State2 = case NewRecvOffset > (RecvMaxData div 2) of
+                true ->
+                    %% Double the limit and send MAX_STREAM_DATA
+                    NewMaxStreamData = RecvMaxData * 2,
+                    UpdatedStream = NewStream#stream_state{recv_max_data = NewMaxStreamData},
+                    MaxStreamDataFrame = quic_frame:encode({max_stream_data, StreamId, NewMaxStreamData}),
+                    State1a = State1#state{streams = maps:put(StreamId, UpdatedStream, Streams)},
+                    send_app_packet(MaxStreamDataFrame, State1a);
+                false ->
+                    State1
+            end,
+
+            %% Check if we need to send MAX_DATA for connection-level flow control
+            %% Send when we've consumed more than 50% of our advertised connection window
+            MaxDataLocalVal = State2#state.max_data_local,
+            State3 = case NewDataReceivedVal > (MaxDataLocalVal div 2) of
+                true ->
+                    %% Extend the connection-level window and send MAX_DATA
+                    NewMaxData = NewDataReceivedVal + MaxDataLocalVal,
+                    MaxDataFrame = quic_frame:encode({max_data, NewMaxData}),
+                    State2a = send_app_packet(MaxDataFrame, State2),
+                    State2a#state{max_data_local = NewMaxData};
+                false ->
+                    State2
+            end,
+
+            %% ACK is sent at packet level by maybe_send_ack
+            State3
+    end.
 
 %% Extract contiguous data from buffer starting at Offset
 %% Returns {Data, NewOffset, UpdatedBuffer}
@@ -3059,18 +3286,6 @@ is_ack_eliciting_frame(padding) -> false;
 is_ack_eliciting_frame({ack, _, _, _}) -> false;
 is_ack_eliciting_frame({connection_close, _, _, _, _}) -> false;
 is_ack_eliciting_frame(_) -> true.
-
-%% Check if a payload contains ack-eliciting frames
-%% ACK and PADDING are not ack-eliciting, everything else is
-is_ack_eliciting_payload(Payload) when is_binary(Payload) ->
-    %% For encoded frames, check the first byte (frame type)
-    case Payload of
-        <<16#00, _/binary>> -> false;  % PADDING
-        <<16#02, _/binary>> -> false;  % ACK
-        <<16#03, _/binary>> -> false;  % ACK_ECN
-        <<>> -> false;
-        _ -> true
-    end.
 
 %% Convert ACK ranges from quic_frame format to quic_loss format
 %% Input from quic_frame: [{LargestAcked, FirstRange} | [{Gap, Range}, ...]]
@@ -3168,22 +3383,33 @@ select_signature_algorithm(_) ->
 
 %% Check if we should transition to a new state
 check_state_transition(CurrentState, State) ->
-    case {CurrentState, State#state.tls_state, has_app_keys(State)} of
-        {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
-            %% Got ServerHello, have handshake keys
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_CERT, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_AWAITING_FINISHED, _} ->
-            {next_state, handshaking, State};
-        {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
-            {next_state, connected, State};
-        {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
-            {next_state, connected, State};
+    %% First check if connection should be closing (CONNECTION_CLOSE received)
+    case State#state.close_reason of
+        connection_closed ->
+            %% Peer sent CONNECTION_CLOSE, transition to draining
+            {next_state, draining, State};
+        stateless_reset ->
+            %% Received stateless reset, transition to draining
+            {next_state, draining, State};
         _ ->
-            {keep_state, State}
+            %% Check for TLS handshake state transitions
+            case {CurrentState, State#state.tls_state, has_app_keys(State)} of
+                {idle, ?TLS_AWAITING_ENCRYPTED_EXT, _} ->
+                    %% Got ServerHello, have handshake keys
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_CERT, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_CERT_VERIFY, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_AWAITING_FINISHED, _} ->
+                    {next_state, handshaking, State};
+                {idle, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    {next_state, connected, State};
+                {handshaking, ?TLS_HANDSHAKE_COMPLETE, true} ->
+                    {next_state, connected, State};
+                _ ->
+                    {keep_state, State}
+            end
     end.
 
 has_app_keys(#state{app_keys = undefined}) -> false;
@@ -3282,21 +3508,30 @@ update_last_activity(State) ->
     set_idle_timer(State1).
 
 %% Open a new stream
-do_open_stream(#state{next_stream_id_bidi = NextId,
+%% Stream ID patterns: Bit 0=initiator (0=client, 1=server), Bit 1=type (0=bidi, 1=uni)
+%% Client bidi=0x00, Server bidi=0x01, Client uni=0x02, Server uni=0x03
+do_open_stream(#state{role = Role, next_stream_id_bidi = NextId,
                       max_streams_bidi_remote = Max,
                       streams = Streams} = State) ->
+    %% Count streams WE initiated (not peer-initiated)
+    LocalPattern = case Role of
+        client -> 0;  % Client-initiated bidi = 0x00
+        server -> 1   % Server-initiated bidi = 0x01
+    end,
     StreamCount = maps:size(maps:filter(fun(Id, _) ->
-        (Id band 16#03) =:= 0  % Client-initiated bidi
+        (Id band 16#03) =:= LocalPattern
     end, Streams)),
     if
         StreamCount >= Max ->
             {error, stream_limit};
         true ->
+            %% Get peer's limit for streams WE initiate (bidi_remote from their perspective)
+            SendMaxData = get_peer_stream_limit(bidi_local_initiated, State),
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
                 send_offset = 0,
-                send_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                send_max_data = SendMaxData,
                 send_fin = false,
                 send_buffer = [],
                 recv_offset = 0,
@@ -3313,22 +3548,29 @@ do_open_stream(#state{next_stream_id_bidi = NextId,
     end.
 
 %% Open a new unidirectional stream
-do_open_unidirectional_stream(#state{next_stream_id_uni = NextId,
+do_open_unidirectional_stream(#state{role = Role, next_stream_id_uni = NextId,
                                       max_streams_uni_remote = Max,
                                       streams = Streams} = State) ->
+    %% Count uni streams WE initiated
+    LocalPattern = case Role of
+        client -> 2;  % Client-initiated uni = 0x02
+        server -> 3   % Server-initiated uni = 0x03
+    end,
     StreamCount = maps:size(maps:filter(fun(Id, _) ->
-        (Id band 16#03) =:= 2  % Client-initiated uni
+        (Id band 16#03) =:= LocalPattern
     end, Streams)),
     if
         StreamCount >= Max ->
             {error, stream_limit};
         true ->
             %% Unidirectional streams are send-only for the initiator
+            %% Get peer's limit for uni streams we initiate
+            SendMaxData = get_peer_stream_limit(uni_local_initiated, State),
             StreamState = #stream_state{
                 id = NextId,
                 state = open,
                 send_offset = 0,
-                send_max_data = ?DEFAULT_INITIAL_MAX_STREAM_DATA,
+                send_max_data = SendMaxData,
                 send_fin = false,
                 send_buffer = [],
                 recv_offset = 0,
@@ -3348,25 +3590,123 @@ do_open_unidirectional_stream(#state{next_stream_id_uni = NextId,
 %% 1200 (min MTU for QUIC) - ~50 bytes overhead = ~1150 bytes
 -define(MAX_STREAM_DATA_PER_PACKET, 1100).
 
+%% @doc Get the peer's stream data limit for a given stream type.
+%% RFC 9000 Section 4.1: Each endpoint independently sets flow control limits.
+%% - bidi_local_initiated: Bidi stream we opened, use peer's initial_max_stream_data_bidi_remote
+%% - bidi_peer_initiated: Bidi stream peer opened, use peer's initial_max_stream_data_bidi_local
+%% - uni_local_initiated: Uni stream we opened, use peer's initial_max_stream_data_uni
+get_peer_stream_limit(StreamType, #state{transport_params = TP}) ->
+    case StreamType of
+        bidi_local_initiated ->
+            maps:get(peer_max_stream_data_bidi_remote, TP,
+                     maps:get(initial_max_stream_data_bidi_remote, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA));
+        bidi_peer_initiated ->
+            maps:get(peer_max_stream_data_bidi_local, TP,
+                     maps:get(initial_max_stream_data_bidi_local, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA));
+        uni_local_initiated ->
+            maps:get(peer_max_stream_data_uni, TP,
+                     maps:get(initial_max_stream_data_uni, TP, ?DEFAULT_INITIAL_MAX_STREAM_DATA))
+    end.
+
+%% @doc Check if stream is locally or peer initiated.
+%% RFC 9000 Section 2.1: Stream ID format determines initiator and type.
+%% Bit 0: 0=client-initiated, 1=server-initiated
+%% Bit 1: 0=bidirectional, 1=unidirectional
+is_locally_initiated(StreamId, #state{role = Role}) ->
+    ClientInitiated = (StreamId band 1) =:= 0,
+    case Role of
+        client -> ClientInitiated;
+        server -> not ClientInitiated
+    end.
+
+%% @doc Check if stream is unidirectional.
+is_unidirectional(StreamId) ->
+    (StreamId band 2) =/= 0.
+
+%% @doc Validate stream direction for sending.
+%% RFC 9000 Section 2.1: Cannot send on peer's unidirectional streams.
+can_send_on_stream(StreamId, State) ->
+    case is_unidirectional(StreamId) of
+        false ->
+            %% Bidirectional - can always send
+            true;
+        true ->
+            %% Unidirectional - can only send if we initiated it
+            is_locally_initiated(StreamId, State)
+    end.
+
 %% Send data on a stream (with fragmentation for large data)
-do_send_data(StreamId, Data, Fin, #state{streams = Streams} = State) ->
+%% Now includes flow control checks at connection and stream level
+do_send_data(StreamId, Data, Fin, #state{streams = Streams,
+                                          max_data_remote = MaxDataRemote,
+                                          data_sent = DataSent} = State) ->
     case maps:find(StreamId, Streams) of
         {ok, StreamState} ->
-            DataBin = iolist_to_binary(Data),
-            Offset = StreamState#stream_state.send_offset,
+            %% Check stream direction (can't send on peer's uni streams)
+            case can_send_on_stream(StreamId, State) of
+                false ->
+                    error_logger:warning_msg("[QUIC] Cannot send on peer-initiated uni stream ~p~n",
+                                             [StreamId]),
+                    {error, stream_state_error};
+                true ->
+                    DataBin = iolist_to_binary(Data),
+                    DataSize = byte_size(DataBin),
+                    Offset = StreamState#stream_state.send_offset,
+                    SendMaxData = StreamState#stream_state.send_max_data,
 
-            %% Fragment and send data
-            NewState = send_stream_data_fragmented(StreamId, Offset, DataBin, Fin, State),
+                    %% Check connection-level flow control
+                    ConnectionAllowed = MaxDataRemote - DataSent,
+                    %% Check stream-level flow control
+                    StreamAllowed = SendMaxData - Offset,
 
-            %% Update stream state
-            NewStreamState = StreamState#stream_state{
-                send_offset = Offset + byte_size(DataBin),
-                send_fin = Fin
-            },
+                    %% Log flow control status
 
-            {ok, NewState#state{
-                streams = maps:put(StreamId, NewStreamState, Streams)
-            }};
+                    case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
+                        {false, _} ->
+                            %% Connection-level flow control blocked
+                            error_logger:warning_msg("[QUIC FC] Connection flow control blocked: "
+                                                     "need ~p, allowed ~p~n",
+                                                     [DataSize, ConnectionAllowed]),
+                            %% Queue for later - MUST return the updated state with queued data!
+                            QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
+                            %% RFC 9000 Section 19.12: DATA_BLOCKED reports the connection data limit
+                            BlockedFrame = quic_frame:encode({data_blocked, MaxDataRemote}),
+                            FinalState = send_app_packet(BlockedFrame, QueuedState),
+                            {ok, FinalState};
+                        {_, false} ->
+                            %% Stream-level flow control blocked
+                            error_logger:warning_msg("[QUIC FC] Stream ~p flow control blocked: "
+                                                     "need ~p, allowed ~p~n",
+                                                     [StreamId, DataSize, StreamAllowed]),
+                            %% Queue for later - MUST return the updated state with queued data!
+                            QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
+                            %% RFC 9000 Section 19.13: STREAM_DATA_BLOCKED reports the stream data limit
+                            BlockedFrame = quic_frame:encode({stream_data_blocked, StreamId, SendMaxData}),
+                            FinalState = send_app_packet(BlockedFrame, QueuedState),
+                            {ok, FinalState};
+                        {true, true} ->
+                            %% Flow control allows sending
+                            %% Fragment and send data - let it handle state updates per fragment
+                            %% This ensures send_offset/data_sent are only updated for data actually sent
+                            {NewState, BytesSent} = send_stream_data_fragmented_tracked(
+                                StreamId, Offset, DataBin, Fin, State),
+                            %% Update stream state based on what was actually sent
+                            case maps:find(StreamId, NewState#state.streams) of
+                                {ok, UpdatedStream} ->
+                                    FinalStream = UpdatedStream#stream_state{
+                                        send_offset = Offset + BytesSent,
+                                        send_fin = (Fin andalso BytesSent =:= DataSize)
+                                    },
+                                    FinalState = NewState#state{
+                                        streams = maps:put(StreamId, FinalStream, NewState#state.streams),
+                                        data_sent = NewState#state.data_sent + BytesSent
+                                    },
+                                    {ok, FinalState};
+                                error ->
+                                    {ok, NewState}
+                            end
+                    end
+            end;
         error ->
             {error, unknown_stream}
     end.
@@ -3472,38 +3812,47 @@ do_send_datagram(Data, #state{cc_state = CCState} = State) ->
             {error, congestion_limited}
     end.
 
-%% Send stream data in fragments that fit in packets
-%% Respects congestion window by checking before each send
-send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
+%% Send stream data in fragments, tracking how many bytes were actually sent
+%% Returns {NewState, BytesSent} where BytesSent is the count of bytes actually transmitted
+%% (not queued due to congestion)
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State) ->
+    send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, 0).
+
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar)
+  when byte_size(Data) =< ?MAX_STREAM_DATA_PER_PACKET ->
     %% Data fits in one packet - check congestion window
     #state{cc_state = CCState} = State,
     PacketSize = byte_size(Data) + ?PACKET_OVERHEAD,
-
-    case quic_cc:can_send(CCState, PacketSize) of
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    case CanSend of
         true ->
             Frame = {stream, StreamId, Offset, Data, Fin},
             Payload = quic_frame:encode(Frame),
-            send_app_packet_internal(Payload, [Frame], State);
+            NewState = send_app_packet_internal(Payload, [Frame], State),
+            {NewState, BytesSentSoFar + byte_size(Data)};
         false ->
             %% Queue the data for later sending when cwnd allows
-            queue_stream_data(StreamId, Offset, Data, Fin, State)
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
+            {QueuedState, BytesSentSoFar}  % Return bytes sent so far, not including queued
     end;
-send_stream_data_fragmented(StreamId, Offset, Data, Fin, State) ->
+send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State, BytesSentSoFar) ->
     %% Split data into chunks and send what we can
     #state{cc_state = CCState} = State,
     PacketSize = ?MAX_STREAM_DATA_PER_PACKET + ?PACKET_OVERHEAD,
-
-    case quic_cc:can_send(CCState, PacketSize) of
+    CanSend = quic_cc:can_send(CCState, PacketSize),
+    case CanSend of
         true ->
             <<Chunk:?MAX_STREAM_DATA_PER_PACKET/binary, Rest/binary>> = Data,
             Frame = {stream, StreamId, Offset, Chunk, false},
             Payload = quic_frame:encode(Frame),
             State1 = send_app_packet_internal(Payload, [Frame], State),
             NewOffset = Offset + ?MAX_STREAM_DATA_PER_PACKET,
-            send_stream_data_fragmented(StreamId, NewOffset, Rest, Fin, State1);
+            NewBytesSent = BytesSentSoFar + ?MAX_STREAM_DATA_PER_PACKET,
+            send_stream_data_fragmented_tracked(StreamId, NewOffset, Rest, Fin, State1, NewBytesSent);
         false ->
             %% Queue remaining data for later
-            queue_stream_data(StreamId, Offset, Data, Fin, State)
+            QueuedState = queue_stream_data(StreamId, Offset, Data, Fin, State),
+            {QueuedState, BytesSentSoFar}  % Return bytes sent so far
     end.
 
 %% Queue stream data when congestion window is full
@@ -3523,21 +3872,40 @@ get_stream_urgency(StreamId, Streams) ->
 
 %% Process send queue when congestion window frees up
 %% Processes streams in priority order (lower urgency = higher priority)
-process_send_queue(#state{send_queue = PQ} = State) ->
+process_send_queue(#state{send_queue = PQ, streams = Streams} = State) ->
     case pqueue_out(PQ) of
         {empty, _} ->
             State;
         {{value, {stream_data, StreamId, Offset, Data, Fin}}, NewPQ} ->
             State1 = State#state{send_queue = NewPQ},
-            State2 = send_stream_data_fragmented(StreamId, Offset, Data, Fin, State1),
+            %% Use tracked sender to properly update send_offset/data_sent
+            {State2, BytesSent} = send_stream_data_fragmented_tracked(StreamId, Offset, Data, Fin, State1),
+            %% Update stream state with bytes actually sent
+            State3 = case BytesSent > 0 of
+                true ->
+                    case maps:find(StreamId, Streams) of
+                        {ok, Stream} ->
+                            NewStream = Stream#stream_state{
+                                send_offset = Stream#stream_state.send_offset + BytesSent
+                            },
+                            State2#state{
+                                streams = maps:put(StreamId, NewStream, State2#state.streams),
+                                data_sent = State2#state.data_sent + BytesSent
+                            };
+                        error ->
+                            State2
+                    end;
+                false ->
+                    State2
+            end,
             %% If data was queued again (cwnd still full), stop processing
-            case pqueue_is_empty(State2#state.send_queue) of
-                true -> State2;
+            case pqueue_is_empty(State3#state.send_queue) of
+                true -> State3;
                 false ->
                     %% Check if we just queued more data (cwnd full)
-                    case State2#state.send_queue =:= State1#state.send_queue of
-                        true -> process_send_queue(State2);  % Keep processing
-                        false -> State2  % New data queued, cwnd full
+                    case State3#state.send_queue =:= State1#state.send_queue of
+                        true -> process_send_queue(State3);  % Keep processing
+                        false -> State3  % New data queued, cwnd full
                     end
             end
     end.
@@ -4201,13 +4569,47 @@ retire_peer_cids(_RetirePrior, State) ->
     State.
 
 %% @doc Apply peer transport parameters to connection state.
-%% Extracts and stores the peer's active_connection_id_limit.
+%% Extracts flow control limits, stream limits, and CID limit from peer's transport params.
+%% RFC 9000 Section 7.4: Transport parameters are applied after the handshake completes.
 apply_peer_transport_params(TransportParams, State) ->
     %% Extract peer's active_connection_id_limit (default: 2 per RFC 9000)
-    PeerLimit = maps:get(active_connection_id_limit, TransportParams, 2),
+    PeerCIDLimit = maps:get(active_connection_id_limit, TransportParams, 2),
+
+    %% Extract connection-level flow control: how much WE can send to THEM
+    %% Peer's initial_max_data tells us the max bytes we can send on this connection
+    MaxDataRemote = maps:get(initial_max_data, TransportParams, ?DEFAULT_INITIAL_MAX_DATA),
+
+    %% Extract stream-level flow control limits for streams we send on
+    %% initial_max_stream_data_bidi_remote: limit for streams WE initiate (from peer's perspective, we're "remote")
+    %% initial_max_stream_data_bidi_local: limit for streams THEY initiate (from peer's perspective, they're "local")
+    %% initial_max_stream_data_uni: limit for unidirectional streams we initiate
+    MaxStreamDataBidiRemote = maps:get(initial_max_stream_data_bidi_remote, TransportParams,
+                                        ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+    MaxStreamDataBidiLocal = maps:get(initial_max_stream_data_bidi_local, TransportParams,
+                                       ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+    MaxStreamDataUni = maps:get(initial_max_stream_data_uni, TransportParams,
+                                 ?DEFAULT_INITIAL_MAX_STREAM_DATA),
+
+    %% Extract stream limits: how many streams WE can open
+    MaxStreamsBidi = maps:get(initial_max_streams_bidi, TransportParams, ?DEFAULT_MAX_STREAMS_BIDI),
+    MaxStreamsUni = maps:get(initial_max_streams_uni, TransportParams, ?DEFAULT_MAX_STREAMS_UNI),
+
+
+    %% Store stream data limits in state for use when opening streams
+    %% These tell us how much we can send on different stream types
     State#state{
-        transport_params = TransportParams,
-        peer_active_cid_limit = PeerLimit
+        transport_params = maps:merge(TransportParams, #{
+            %% Store parsed limits for easy access
+            peer_max_stream_data_bidi_remote => MaxStreamDataBidiRemote,
+            peer_max_stream_data_bidi_local => MaxStreamDataBidiLocal,
+            peer_max_stream_data_uni => MaxStreamDataUni
+        }),
+        peer_active_cid_limit = PeerCIDLimit,
+        %% Connection-level send limit
+        max_data_remote = MaxDataRemote,
+        %% Stream limits (how many streams we can open)
+        max_streams_bidi_remote = MaxStreamsBidi,
+        max_streams_uni_remote = MaxStreamsUni
     }.
 
 %% @doc Handle RETIRE_CONNECTION_ID frame from peer.

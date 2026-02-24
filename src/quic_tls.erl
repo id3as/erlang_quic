@@ -515,10 +515,25 @@ decode_tp_value(?TP_INITIAL_SCID, Value) -> Value;
 decode_tp_value(?TP_RETRY_SCID, Value) -> Value;
 decode_tp_value(?TP_DISABLE_ACTIVE_MIGRATION, <<>>) -> true;
 decode_tp_value(?TP_PREFERRED_ADDRESS, Value) -> decode_preferred_address(Value);
-decode_tp_value(_, Value) ->
-    %% Most parameters are varints
+%% Known integer parameters (varints)
+decode_tp_value(Id, Value) when Id =:= ?TP_MAX_IDLE_TIMEOUT;
+                                Id =:= ?TP_MAX_UDP_PAYLOAD_SIZE;
+                                Id =:= ?TP_INITIAL_MAX_DATA;
+                                Id =:= ?TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL;
+                                Id =:= ?TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE;
+                                Id =:= ?TP_INITIAL_MAX_STREAM_DATA_UNI;
+                                Id =:= ?TP_INITIAL_MAX_STREAMS_BIDI;
+                                Id =:= ?TP_INITIAL_MAX_STREAMS_UNI;
+                                Id =:= ?TP_ACK_DELAY_EXPONENT;
+                                Id =:= ?TP_MAX_ACK_DELAY;
+                                Id =:= ?TP_ACTIVE_CONNECTION_ID_LIMIT ->
+    %% Known integer parameters are varints
     {Int, _} = quic_varint:decode(Value),
-    Int.
+    Int;
+decode_tp_value(_Id, Value) ->
+    %% RFC 9000 Section 18: Unknown transport parameters MUST be ignored.
+    %% Store raw value to avoid decode errors on unknown/extension parameters.
+    Value.
 
 %% @doc Decode preferred_address transport parameter (RFC 9000 Section 18.2).
 %% Format:

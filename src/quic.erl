@@ -45,6 +45,7 @@
     sockname/1,
     peercert/1,
     set_owner/2,
+    set_owner_sync/2,
     send_datagram/2,
     setopts/2,
     migrate/1,
@@ -274,6 +275,22 @@ set_owner(ConnRef, NewOwner) when is_reference(ConnRef), is_pid(NewOwner) ->
 set_owner(ConnPid, NewOwner) when is_pid(ConnPid), is_pid(NewOwner) ->
     quic_connection:set_owner(ConnPid, NewOwner);
 set_owner(_ConnRef, _NewOwner) ->
+    {error, badarg}.
+
+%% @doc Transfer ownership of a connection to a new process (synchronous).
+%% Blocks until ownership is transferred. Use this when you need to ensure
+%% the new owner receives all subsequent messages including {connected, Info}.
+-spec set_owner_sync(ConnRef, NewOwner) -> ok | {error, term()}
+    when ConnRef :: reference() | pid(),
+         NewOwner :: pid().
+set_owner_sync(ConnRef, NewOwner) when is_reference(ConnRef), is_pid(NewOwner) ->
+    case quic_connection:lookup(ConnRef) of
+        {ok, Pid} -> quic_connection:set_owner_sync(Pid, NewOwner);
+        error -> {error, not_found}
+    end;
+set_owner_sync(ConnPid, NewOwner) when is_pid(ConnPid), is_pid(NewOwner) ->
+    quic_connection:set_owner_sync(ConnPid, NewOwner);
+set_owner_sync(_ConnRef, _NewOwner) ->
     {error, badarg}.
 
 %% @doc Send a datagram on the connection.

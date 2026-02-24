@@ -189,11 +189,12 @@ unprotect_header(HP, ProtectedHeader, EncryptedPayload, _PNOffset) ->
     end.
 
 %% @doc Compute the nonce for AEAD by XORing IV with packet number.
-%% Packet number is left-padded to 12 bytes.
+%% RFC 9001 Section 5.3: The 64 bits of the reconstructed QUIC packet number
+%% in network byte order are left-padded with zeros to the size of the IV.
 -spec compute_nonce(binary(), non_neg_integer()) -> binary().
 compute_nonce(IV, PN) when byte_size(IV) =:= 12 ->
-    %% Left-pad PN to 12 bytes and XOR with IV
-    PNPadded = <<0:64, PN:32>>,
+    %% Left-pad 64-bit PN to 12 bytes (96 bits) and XOR with IV
+    PNPadded = <<0:32, PN:64>>,
     crypto:exor(IV, PNPadded).
 
 %%====================================================================

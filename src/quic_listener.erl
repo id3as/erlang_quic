@@ -458,8 +458,9 @@ create_connection(Packet, DCID, Version, RemoteAddr,
                 Fun when is_function(Fun, 2) ->
                     case Fun(ConnPid, ConnRef) of
                         {ok, HandlerPid} when is_pid(HandlerPid) ->
-                            %% Transfer ownership to handler
-                            case quic:set_owner(ConnRef, HandlerPid) of
+                            %% Transfer ownership to handler (sync to ensure it completes
+                            %% before any packets trigger handshake completion)
+                            case quic:set_owner_sync(ConnRef, HandlerPid) of
                                 ok ->
                                     ok;
                                 {error, Reason} ->
