@@ -31,7 +31,8 @@
     %% Congestion control events
     on_packet_sent/2,
     on_packets_acked/2,
-    on_packets_acked/3,  %% With LargestAckedSentTime for proper recovery exit
+    %% With LargestAckedSentTime for proper recovery exit
+    on_packets_acked/3,
     on_packets_lost/2,
     on_congestion_event/2,
 
@@ -56,9 +57,13 @@
 ]).
 
 %% Constants from RFC 9002
--define(MAX_DATAGRAM_SIZE, 1200).  % Minimum QUIC packet size
--define(INITIAL_WINDOW, 14720).     % 10 * 1472 or similar
--define(MINIMUM_WINDOW, 2400).      % 2 * MAX_DATAGRAM_SIZE
+
+% Minimum QUIC packet size
+-define(MAX_DATAGRAM_SIZE, 1200).
+% 10 * 1472 or similar
+-define(INITIAL_WINDOW, 14720).
+% 2 * MAX_DATAGRAM_SIZE
+-define(MINIMUM_WINDOW, 2400).
 -define(LOSS_REDUCTION_FACTOR, 0.5).
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
@@ -115,8 +120,13 @@ new(Opts) ->
 
 %% @doc Record that a packet was sent.
 -spec on_packet_sent(cc_state(), non_neg_integer()) -> cc_state().
-on_packet_sent(#cc_state{bytes_in_flight = InFlight,
-                         first_sent_time = undefined} = State, Size) ->
+on_packet_sent(
+    #cc_state{
+        bytes_in_flight = InFlight,
+        first_sent_time = undefined
+    } = State,
+    Size
+) ->
     Now = erlang:monotonic_time(millisecond),
     State#cc_state{
         bytes_in_flight = InFlight + Size,
@@ -136,9 +146,15 @@ on_packets_acked(State, AckedBytes) ->
     on_packets_acked(State, AckedBytes, Now).
 
 -spec on_packets_acked(cc_state(), non_neg_integer(), non_neg_integer()) -> cc_state().
-on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
-                           recovery_start_time = RecoveryStart} = State,
-                 AckedBytes, LargestAckedSentTime) ->
+on_packets_acked(
+    #cc_state{
+        bytes_in_flight = InFlight,
+        in_recovery = true,
+        recovery_start_time = RecoveryStart
+    } = State,
+    AckedBytes,
+    LargestAckedSentTime
+) ->
     NewInFlight = max(0, InFlight - AckedBytes),
     %% RFC 9002 Section 7.3.2: A recovery period ends and the sender
     %% enters congestion avoidance when a packet sent during the recovery period
@@ -148,12 +164,14 @@ on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
             %% Exit recovery - packet sent after recovery started was acked
             %% Now in congestion avoidance, can increase cwnd
             #cc_state{cwnd = Cwnd, ssthresh = SSThresh, max_datagram_size = MaxDS} = State,
-            NewCwnd = case Cwnd < SSThresh of
-                true -> Cwnd + AckedBytes;
-                false ->
-                    Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
-                    Cwnd + max(Increment, 1)
-            end,
+            NewCwnd =
+                case Cwnd < SSThresh of
+                    true ->
+                        Cwnd + AckedBytes;
+                    false ->
+                        Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
+                        Cwnd + max(Increment, 1)
+                end,
             State#cc_state{
                 bytes_in_flight = NewInFlight,
                 in_recovery = false,
@@ -164,22 +182,30 @@ on_packets_acked(#cc_state{bytes_in_flight = InFlight, in_recovery = true,
             %% Still in recovery, don't increase cwnd
             State#cc_state{bytes_in_flight = NewInFlight}
     end;
-on_packets_acked(#cc_state{cwnd = Cwnd, ssthresh = SSThresh,
-                           bytes_in_flight = InFlight,
-                           max_datagram_size = MaxDS} = State, AckedBytes, _LargestAckedSentTime) ->
+on_packets_acked(
+    #cc_state{
+        cwnd = Cwnd,
+        ssthresh = SSThresh,
+        bytes_in_flight = InFlight,
+        max_datagram_size = MaxDS
+    } = State,
+    AckedBytes,
+    _LargestAckedSentTime
+) ->
     NewInFlight = max(0, InFlight - AckedBytes),
 
     %% Increase cwnd based on phase
-    NewCwnd = case Cwnd < SSThresh of
-        true ->
-            %% Slow start: increase by bytes acked
-            Cwnd + AckedBytes;
-        false ->
-            %% Congestion avoidance: increase by ~1 MSS per RTT
-            %% cwnd += max_datagram_size * acked_bytes / cwnd
-            Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
-            Cwnd + max(Increment, 1)
-    end,
+    NewCwnd =
+        case Cwnd < SSThresh of
+            true ->
+                %% Slow start: increase by bytes acked
+                Cwnd + AckedBytes;
+            false ->
+                %% Congestion avoidance: increase by ~1 MSS per RTT
+                %% cwnd += max_datagram_size * acked_bytes / cwnd
+                Increment = (MaxDS * AckedBytes) div max(Cwnd, 1),
+                Cwnd + max(Increment, 1)
+        end,
 
     State#cc_state{
         cwnd = NewCwnd,
@@ -196,13 +222,19 @@ on_packets_lost(#cc_state{bytes_in_flight = InFlight} = State, LostBytes) ->
 %% @doc Handle a congestion event (packet loss detected).
 %% SentTime is the time when the lost packet was sent.
 -spec on_congestion_event(cc_state(), non_neg_integer()) -> cc_state().
-on_congestion_event(#cc_state{in_recovery = true,
-                              recovery_start_time = RecoveryStart} = State,
-                    SentTime) when SentTime =< RecoveryStart ->
+on_congestion_event(
+    #cc_state{
+        in_recovery = true,
+        recovery_start_time = RecoveryStart
+    } = State,
+    SentTime
+) when SentTime =< RecoveryStart ->
     %% Already in recovery for this event
     State;
-on_congestion_event(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
-                    SentTime) ->
+on_congestion_event(
+    #cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
+    SentTime
+) ->
     Now = erlang:monotonic_time(millisecond),
 
     %% Enter recovery
@@ -216,7 +248,8 @@ on_congestion_event(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
         ssthresh = NewSSThresh,
         recovery_start_time = Now,
         in_recovery = true,
-        first_sent_time = SentTime  % Track for persistent congestion
+        % Track for persistent congestion
+        first_sent_time = SentTime
     }.
 
 %%====================================================================
@@ -228,12 +261,14 @@ on_congestion_event(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State,
 %% NewCECount is the ECN-CE count from the received ACK frame.
 %% SentTime is the time when the largest acknowledged packet was sent.
 -spec on_ecn_ce(cc_state(), non_neg_integer()) -> cc_state().
-on_ecn_ce(#cc_state{ecn_ce_counter = OldCount} = State, NewCECount)
-  when NewCECount =< OldCount ->
+on_ecn_ce(#cc_state{ecn_ce_counter = OldCount} = State, NewCECount) when
+    NewCECount =< OldCount
+->
     %% No new CE marks, no action needed
     State;
-on_ecn_ce(#cc_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewCECount)
-  when NewCECount > OldCount ->
+on_ecn_ce(#cc_state{in_recovery = true, ecn_ce_counter = OldCount} = State, NewCECount) when
+    NewCECount > OldCount
+->
     %% Already in recovery, just update counter
     State#cc_state{ecn_ce_counter = NewCECount};
 on_ecn_ce(#cc_state{cwnd = Cwnd, max_datagram_size = MaxDS} = State, NewCECount) ->
@@ -297,8 +332,11 @@ in_recovery(#cc_state{in_recovery = R}) -> R.
 %% @doc Detect persistent congestion from lost packets.
 %% Returns true if lost packets span more than PTO * kPersistentCongestionThreshold.
 %% LostPackets is a list of {PacketNumber, TimeSent} tuples.
--spec detect_persistent_congestion([{non_neg_integer(), non_neg_integer()}],
-                                   non_neg_integer(), cc_state()) -> boolean().
+-spec detect_persistent_congestion(
+    [{non_neg_integer(), non_neg_integer()}],
+    non_neg_integer(),
+    cc_state()
+) -> boolean().
 detect_persistent_congestion([], _PTO, _State) ->
     false;
 detect_persistent_congestion([_], _PTO, _State) ->

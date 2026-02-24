@@ -25,7 +25,6 @@ start_link(Port, Opts, Parent) ->
 %%====================================================================
 
 init({Port, Opts, Parent}) ->
-
     PoolSize = 1 + maps:get(pool_size, Opts, 1),
     Intensity = ceil(math:log2(PoolSize)),
     SupFlags = #{strategy => one_for_one, intensity => Intensity, period => 5},
@@ -50,7 +49,7 @@ init({Port, Opts, Parent}) ->
             type => worker,
             modules => [quic_listener]
         }
-        || N <- lists:seq(1, PoolSize)
+     || N <- lists:seq(1, PoolSize)
     ],
 
     {ok, {SupFlags, Children}}.
