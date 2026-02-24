@@ -27,7 +27,8 @@ client_initial_key_derivation_test() ->
     %% From RFC 9001 Appendix A.1:
     %% client_initial_secret derived from initial_secret with "client in" label
     ClientInitialSecret = hexstr_to_bin(
-        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
+        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"
+    ),
 
     %% Expected keys from RFC 9001 Appendix A.1
     ExpectedKey = hexstr_to_bin("1f369613dd76d5467730efcbe3b1a22d"),
@@ -48,7 +49,8 @@ server_initial_key_derivation_test() ->
     %% From RFC 9001 Appendix A.1:
     %% server_initial_secret derived from initial_secret with "server in" label
     ServerInitialSecret = hexstr_to_bin(
-        "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
+        "3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"
+    ),
 
     %% Expected keys from RFC 9001 Appendix A.1
     ExpectedKey = hexstr_to_bin("cf3a5331653c364c88f0f379b6067e37"),
@@ -71,13 +73,15 @@ full_key_derivation_chain_test() ->
     %% Step 1: Initial secret from DCID
     InitialSecret = quic_keys:derive_initial_secret(DCID),
     ExpectedInitialSecret = hexstr_to_bin(
-        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"),
+        "7db5df06e7a69e432496adedb00851923595221596ae2ae9fb8115c1e9ed0a44"
+    ),
     ?assertEqual(ExpectedInitialSecret, InitialSecret),
 
     %% Step 2: Client traffic secret from initial secret
     ClientSecret = quic_hkdf:expand_label(InitialSecret, <<"client in">>, <<>>, 32),
     ExpectedClientSecret = hexstr_to_bin(
-        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
+        "c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"
+    ),
     ?assertEqual(ExpectedClientSecret, ClientSecret),
 
     %% Step 3: Keys from traffic secret (using quic_keys module)
@@ -141,7 +145,8 @@ aead_crypto_frame_test() ->
         "0018001000070005046832687400100018001604616c706e02683208"
         "687474702f312e31000d00100010040805080604050306030203050100"
         "2d00020101003300260024001d0020358072d6365880d1aeea329adf"
-        "9121383851ed21a28e3b75e965d0d2cd166254"),
+        "9121383851ed21a28e3b75e965d0d2cd166254"
+    ),
 
     %% Full plaintext: CRYPTO frame header + partial ClientHello + padding
     Plaintext = <<CryptoFrameHeader/binary, ClientHelloStart/binary>>,
@@ -223,11 +228,14 @@ header_protection_application_test() ->
     %% Unprotected first byte: 0xc3 (form=1, fixed=1, type=00, reserved=00, pn_len=11)
     %% Protected first byte: 0xc0 (first byte XOR (mask[0] AND 0x0f))
 
-    MaskByte0 = 16#43,  % From mask computation above
+    % From mask computation above
+    MaskByte0 = 16#43,
     UnprotectedFirstByte = 16#c3,
 
     %% Long header: mask lower 4 bits only
-    FirstByteMask = MaskByte0 band 16#0f,  % = 0x03
+
+    % = 0x03
+    FirstByteMask = MaskByte0 band 16#0f,
     ProtectedFirstByte = UnprotectedFirstByte bxor FirstByteMask,
 
     ?assertEqual(16#c0, ProtectedFirstByte).
@@ -245,7 +253,9 @@ packet_number_protection_test() ->
     ProtectedPN = crypto:exor(UnprotectedPN, MaskBytes),
 
     %% Expected from RFC 9001 A.2
-    ExpectedProtectedPN = hexstr_to_bin("7b9aee38"),  % Different due to PN length
+
+    % Different due to PN length
+    ExpectedProtectedPN = hexstr_to_bin("7b9aee38"),
 
     %% Actually in A.2, with 2-byte PN (pn_len=01 in byte):
     %% Let's verify 2-byte case
@@ -265,7 +275,8 @@ chacha20_header_protection_mask_test() ->
     %% From RFC 9001 Appendix A.5
     %% HP key for ChaCha20-Poly1305 (32 bytes)
     HP = hexstr_to_bin(
-        "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"),
+        "25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4"
+    ),
 
     %% Sample from A.5 (16 bytes)
     Sample = hexstr_to_bin("5e5cd55c41f69080575d7999c25a5bfb"),
@@ -277,7 +288,7 @@ chacha20_header_protection_mask_test() ->
     <<Counter:32/little, Nonce:12/binary>> = Sample,
 
     %% Generate mask using ChaCha20 with counter from sample
-    Zeros = <<0,0,0,0,0>>,
+    Zeros = <<0, 0, 0, 0, 0>>,
     Mask = crypto:crypto_one_time(chacha20, HP, <<Counter:32/little, Nonce/binary>>, Zeros, true),
 
     ?assertEqual(ExpectedMask, Mask).
@@ -322,7 +333,7 @@ full_protection_flow_test() ->
 
     %% Verify HP mask computation works
     %% Need at least 20 bytes of ciphertext for sample
-    PaddedPlaintext = <<Plaintext/binary, 0:(20*8)>>,
+    PaddedPlaintext = <<Plaintext/binary, 0:(20 * 8)>>,
     PaddedCiphertext = quic_aead:encrypt(Key, IV, PN, AAD, PaddedPlaintext, aes_128_gcm),
 
     %% Extract sample (bytes 4-19 of ciphertext)
@@ -426,27 +437,34 @@ quiche_comparison_vectors_test() ->
     %% RFC 9001 Appendix A values (these match quiche)
     Vectors = [
         %% Client Initial
-        {hexstr_to_bin("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
-         hexstr_to_bin("1f369613dd76d5467730efcbe3b1a22d"),
-         hexstr_to_bin("fa044b2f42a3fd3b46fb255c"),
-         hexstr_to_bin("9f50449e04a0e810283a1e9933adedd2")},
+        {
+            hexstr_to_bin("c00cf151ca5be075ed0ebfb5c80323c42d6b7db67881289af4008f1f6c357aea"),
+            hexstr_to_bin("1f369613dd76d5467730efcbe3b1a22d"),
+            hexstr_to_bin("fa044b2f42a3fd3b46fb255c"),
+            hexstr_to_bin("9f50449e04a0e810283a1e9933adedd2")
+        },
 
         %% Server Initial
-        {hexstr_to_bin("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
-         hexstr_to_bin("cf3a5331653c364c88f0f379b6067e37"),
-         hexstr_to_bin("0ac1493ca1905853b0bba03e"),
-         hexstr_to_bin("c206b8d9b9f0f37644430b490eeaa314")}
+        {
+            hexstr_to_bin("3c199828fd139efd216c155ad844cc81fb82fa8d7446fa7d78be803acdda951b"),
+            hexstr_to_bin("cf3a5331653c364c88f0f379b6067e37"),
+            hexstr_to_bin("0ac1493ca1905853b0bba03e"),
+            hexstr_to_bin("c206b8d9b9f0f37644430b490eeaa314")
+        }
     ],
 
-    lists:foreach(fun({Secret, ExpectedKey, ExpectedIV, ExpectedHP}) ->
-        Key = quic_hkdf:expand_label(Secret, <<"quic key">>, <<>>, 16),
-        IV = quic_hkdf:expand_label(Secret, <<"quic iv">>, <<>>, 12),
-        HP = quic_hkdf:expand_label(Secret, <<"quic hp">>, <<>>, 16),
+    lists:foreach(
+        fun({Secret, ExpectedKey, ExpectedIV, ExpectedHP}) ->
+            Key = quic_hkdf:expand_label(Secret, <<"quic key">>, <<>>, 16),
+            IV = quic_hkdf:expand_label(Secret, <<"quic iv">>, <<>>, 12),
+            HP = quic_hkdf:expand_label(Secret, <<"quic hp">>, <<>>, 16),
 
-        ?assertEqual(ExpectedKey, Key),
-        ?assertEqual(ExpectedIV, IV),
-        ?assertEqual(ExpectedHP, HP)
-    end, Vectors).
+            ?assertEqual(ExpectedKey, Key),
+            ?assertEqual(ExpectedIV, IV),
+            ?assertEqual(ExpectedHP, HP)
+        end,
+        Vectors
+    ).
 
 %%====================================================================
 %% RFC 9001 Appendix A.2 - Complete Client Initial Packet
@@ -470,17 +488,22 @@ rfc9001_a2_unprotected_header_test() ->
     %% 00000002 = packet number 2 (4 bytes)
 
     ExpectedUnprotectedHeader = hexstr_to_bin(
-        "c300000001088394c8f03e5157080000449e00000002"),
+        "c300000001088394c8f03e5157080000449e00000002"
+    ),
 
     %% Verify header size
     ?assertEqual(22, byte_size(ExpectedUnprotectedHeader)),
 
     %% Verify first byte breakdown
     FirstByte = 16#c3,
-    ?assertEqual(1, (FirstByte bsr 7) band 1),   % Long header
-    ?assertEqual(1, (FirstByte bsr 6) band 1),   % Fixed bit
-    ?assertEqual(0, (FirstByte bsr 4) band 3),   % Initial type
-    ?assertEqual(3, FirstByte band 3).           % PN length = 4 bytes
+    % Long header
+    ?assertEqual(1, (FirstByte bsr 7) band 1),
+    % Fixed bit
+    ?assertEqual(1, (FirstByte bsr 6) band 1),
+    % Initial type
+    ?assertEqual(0, (FirstByte bsr 4) band 3),
+    % PN length = 4 bytes
+    ?assertEqual(3, FirstByte band 3).
 
 rfc9001_a2_sample_position_test() ->
     %% Sample position = pn_offset + 4

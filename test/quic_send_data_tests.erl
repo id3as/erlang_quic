@@ -43,7 +43,9 @@
 %% Verify stream is created when server receives data on client-initiated stream
 server_creates_stream_on_receive_test() ->
     %% Simulate stream state as server would see it after receiving client data
-    StreamId = 0,  % Client-initiated bidirectional
+
+    % Client-initiated bidirectional
+    StreamId = 0,
     StreamState = create_stream_state(StreamId, server),
 
     %% Verify stream is properly initialized for bidirectional communication
@@ -79,14 +81,16 @@ stream_flow_control_blocks_test() ->
         id = 0,
         state = open,
         send_offset = 1000,
-        send_max_data = 1000,  % Already at limit
+        % Already at limit
+        send_max_data = 1000,
         send_fin = false
     },
 
     %% Check if we can send more data
     DataSize = 100,
-    CanSend = StreamState#stream_state.send_offset + DataSize =<
-              StreamState#stream_state.send_max_data,
+    CanSend =
+        StreamState#stream_state.send_offset + DataSize =<
+            StreamState#stream_state.send_max_data,
     ?assertNot(CanSend).
 
 %% Test send allowed within stream flow control
@@ -100,8 +104,9 @@ stream_flow_control_allows_test() ->
     },
 
     DataSize = 100,
-    CanSend = StreamState#stream_state.send_offset + DataSize =<
-              StreamState#stream_state.send_max_data,
+    CanSend =
+        StreamState#stream_state.send_offset + DataSize =<
+            StreamState#stream_state.send_max_data,
     ?assert(CanSend).
 
 %% Test MAX_STREAM_DATA unblocks sending
@@ -122,8 +127,9 @@ max_stream_data_unblocks_test() ->
 
     %% Now can send
     DataSize = 500,
-    CanSend = StreamState1#stream_state.send_offset + DataSize =<
-              StreamState1#stream_state.send_max_data,
+    CanSend =
+        StreamState1#stream_state.send_offset + DataSize =<
+            StreamState1#stream_state.send_max_data,
     ?assert(CanSend).
 
 %%====================================================================
@@ -175,8 +181,9 @@ cc_acks_free_cwnd_test() ->
 keys_required_for_send_test() ->
     %% When app_keys is undefined, cannot send 1-RTT data
     %% This tests the precondition - keys must exist
-    Keys = {#crypto_keys{key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>},
-            #crypto_keys{key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>}},
+    Keys = {#crypto_keys{key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>}, #crypto_keys{
+        key = <<"k">>, iv = <<"iv">>, hp = <<"hp">>
+    }},
     ?assertNotEqual(undefined, Keys).
 
 %%====================================================================
@@ -186,8 +193,16 @@ keys_required_for_send_test() ->
 %% Test data gets queued when CC blocks
 data_queued_when_blocked_test() ->
     %% Create an empty priority queue
-    PQ = {queue:new(), queue:new(), queue:new(), queue:new(),
-          queue:new(), queue:new(), queue:new(), queue:new()},
+    PQ = {
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new()
+    },
 
     %% Queue some data
     Entry = {stream_data, 0, 0, <<"hello">>, false},
@@ -202,8 +217,16 @@ data_queued_when_blocked_test() ->
 %% Test queued data can be dequeued
 queued_data_dequeue_test() ->
     %% Create a queue with one entry
-    PQ = {queue:new(), queue:new(), queue:new(), queue:new(),
-          queue:new(), queue:new(), queue:new(), queue:new()},
+    PQ = {
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new()
+    },
     Entry = {stream_data, 0, 0, <<"hello">>, false},
     Urgency = 3,
     Bucket = element(Urgency + 1, PQ),
@@ -218,8 +241,16 @@ queued_data_dequeue_test() ->
 %% Test priority ordering - lower urgency dequeues first
 priority_ordering_test() ->
     %% Create queue with entries at different priorities
-    PQ0 = {queue:new(), queue:new(), queue:new(), queue:new(),
-           queue:new(), queue:new(), queue:new(), queue:new()},
+    PQ0 = {
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new(),
+        queue:new()
+    },
 
     %% Add entry at urgency 3 (lower priority)
     Entry3 = {stream_data, 0, 0, <<"low">>, false},
@@ -259,7 +290,8 @@ full_send_flow_test() ->
 
 %% Test flow when stream not found
 send_unknown_stream_test() ->
-    Streams = #{4 => create_stream_state(4, server)},  % Different stream
+    % Different stream
+    Streams = #{4 => create_stream_state(4, server)},
 
     %% Try to send on stream 0
     Result = maps:find(0, Streams),

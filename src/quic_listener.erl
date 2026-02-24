@@ -136,15 +136,17 @@ init({Port, Opts}) ->
     ReusePort = maps:get(reuseport, Opts, false),
     ExtraFlags = maps:get(extra_socket_opts, Opts, []),
 
-    SocketOpts = [
-        binary,
-        inet,
-        {active, ActiveN},
-        {reuseaddr, true}
-    ] ++ case ReusePort of
-        true -> [{reuseport, true}, {reuseport_lb, true}];
-        false -> []
-    end ++ ExtraFlags,
+    SocketOpts =
+        [
+            binary,
+            inet,
+            {active, ActiveN},
+            {reuseaddr, true}
+        ] ++
+            case ReusePort of
+                true -> [{reuseport, true}, {reuseport_lb, true}];
+                false -> []
+            end ++ ExtraFlags,
     case gen_udp:open(Port, SocketOpts) of
         {ok, Socket} ->
             {ok, {Socket, Opts}, {continue, discover_manager}};
@@ -193,16 +195,13 @@ handle_continue(discover_manager, {Socket, Opts}) ->
 -spec handle_call(term(), gen_server:from(), state()) -> {reply, term(), state()}.
 handle_call(get_port, _From, #listener_state{port = Port} = State) ->
     {reply, Port, State};
-
 %% @doc false
 handle_call(get_socket_info, _From, #listener_state{socket = Socket, port = Port} = State) ->
     SockInfo = inet:info(Socket),
     {reply, #{port => Port, socket => Socket, info => SockInfo}, State};
-
 handle_call(get_connections, _From, #listener_state{connections = Conns} = State) ->
     Pids = ets:foldl(fun({_CID, Pid}, Acc) -> [Pid | Acc] end, [], Conns),
     {reply, lists:usort(Pids), State};
-
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
@@ -213,13 +212,16 @@ handle_cast(_Msg, State) ->
 
 %% @doc false
 %% Handle incoming UDP packets
-handle_info({udp, Socket, SrcIP, SrcPort, Packet},
-            #listener_state{socket = Socket} = State) ->
-    error_logger:info_msg("[QUIC listener] Received UDP packet from ~p:~p, size=~p~n",
-                          [SrcIP, SrcPort, byte_size(Packet)]),
+handle_info(
+    {udp, Socket, SrcIP, SrcPort, Packet},
+    #listener_state{socket = Socket} = State
+) ->
+    error_logger:info_msg(
+        "[QUIC listener] Received UDP packet from ~p:~p, size=~p~n",
+        [SrcIP, SrcPort, byte_size(Packet)]
+    ),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
-
 %% TODO: this might still be accepting more packets
 %% than connection workers might be willing to accept
 %% Handle socket going passive (backpressure with {active, N})
@@ -227,22 +229,23 @@ handle_info({udp_passive, Socket}, #listener_state{socket = Socket, opts = Opts}
     N = maps:get(active_n, Opts, 100),
     inet:setopts(Socket, [{active, N}]),
     {noreply, State};
-
 %% Handle connection process exit
 handle_info({'EXIT', Pid, _Reason}, #listener_state{connections = Conns} = State) ->
     cleanup_connection(Conns, Pid),
     {noreply, State};
-
 %% Handle UDP from different socket (shouldn't happen)
 handle_info({udp, _OtherSocket, _SrcIP, _SrcPort, _Packet}, State) ->
     {noreply, State};
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
 %% @doc false
-terminate(_Reason, #listener_state{connections = ConnTab, tickets_table = TicketTab,
-                                   owns_tables = OwnsTables, socket = Socket}) ->
+terminate(_Reason, #listener_state{
+    connections = ConnTab,
+    tickets_table = TicketTab,
+    owns_tables = OwnsTables,
+    socket = Socket
+}) ->
     safe_close_socket(Socket),
     %% Only delete ETS tables if we own them (standalone mode, not pool mode)
     case OwnsTables of
@@ -266,10 +269,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%====================================================================
 
 safe_close_socket(Socket) ->
-    try gen_udp:close(Socket) catch _:_ -> ok end.
+    try
+        gen_udp:close(Socket)
+    catch
+        _:_ -> ok
+    end.
 
 safe_delete_table(Tab) ->
-    try ets:delete(Tab) catch _:_ -> ok end.
+    try
+        ets:delete(Tab)
+    catch
+        _:_ -> ok
+    end.
 
 %% Initialize QUIC-LB CID configuration from options
 %% Returns {CIDConfig | undefined, DCIDLen}
@@ -284,36 +295,43 @@ init_cid_config(Opts, ResetSecret) ->
             case quic_lb:new_config(LBConfig) of
                 {ok, LBCfg} ->
                     CIDLen = quic_lb:expected_cid_len(LBCfg),
-                    case quic_lb:new_cid_config(#{
-                        lb_config => LBCfg,
-                        cid_len => CIDLen,
-                        reset_secret => ResetSecret
-                    }) of
+                    case
+                        quic_lb:new_cid_config(#{
+                            lb_config => LBCfg,
+                            cid_len => CIDLen,
+                            reset_secret => ResetSecret
+                        })
+                    of
                         {ok, CIDConfig} ->
                             {CIDConfig, CIDLen};
                         {error, Reason} ->
                             error_logger:warning_msg(
-                                "QUIC listener: invalid CID config: ~p~n", [Reason]),
+                                "QUIC listener: invalid CID config: ~p~n", [Reason]
+                            ),
                             {undefined, 8}
                     end;
                 {error, Reason} ->
                     error_logger:warning_msg(
-                        "QUIC listener: invalid LB config: ~p~n", [Reason]),
+                        "QUIC listener: invalid LB config: ~p~n", [Reason]
+                    ),
                     {undefined, 8}
             end;
         #lb_config{} = LBCfg ->
             %% LB config provided as record
             CIDLen = quic_lb:expected_cid_len(LBCfg),
-            case quic_lb:new_cid_config(#{
-                lb_config => LBCfg,
-                cid_len => CIDLen,
-                reset_secret => ResetSecret
-            }) of
+            case
+                quic_lb:new_cid_config(#{
+                    lb_config => LBCfg,
+                    cid_len => CIDLen,
+                    reset_secret => ResetSecret
+                })
+            of
                 {ok, CIDConfig} ->
                     {CIDConfig, CIDLen};
                 {error, Reason} ->
                     error_logger:warning_msg(
-                        "QUIC listener: invalid CID config: ~p~n", [Reason]),
+                        "QUIC listener: invalid CID config: ~p~n", [Reason]
+                    ),
                     {undefined, 8}
             end
     end.
@@ -333,24 +351,30 @@ get_tables(#{supervisor := SupPid}) ->
     Children = supervisor:which_children(SupPid),
     {quic_listener_manager, ManagerPid, _, _} = lists:keyfind(quic_listener_manager, 1, Children),
     {ok, {ConnTab, TicketTab}} = quic_listener_manager:get_tables(ManagerPid),
-    {ConnTab, TicketTab, false};  % Pool mode - don't own tables
+    % Pool mode - don't own tables
+    {ConnTab, TicketTab, false};
 get_tables(_) ->
     ConnTab = ets:new(quic_connections, [set, protected]),
     TicketTab = ets:new(quic_tickets, [set, protected]),
-    {ConnTab, TicketTab, true}.   % Standalone mode - own tables
+    % Standalone mode - own tables
+    {ConnTab, TicketTab, true}.
 
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
         {initial, DCID, _SCID, Version, _Rest} ->
-            error_logger:info_msg("[QUIC listener] Initial packet from ~p, DCID=~p, Version=~.16B~n",
-                                  [RemoteAddr, DCID, Version]),
+            error_logger:info_msg(
+                "[QUIC listener] Initial packet from ~p, DCID=~p, Version=~.16B~n",
+                [RemoteAddr, DCID, Version]
+            ),
             handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
         {short, DCID, _Rest} ->
             error_logger:info_msg("[QUIC listener] Short header packet, DCID=~p~n", [DCID]),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, PacketType, _Rest} ->
-            error_logger:info_msg("[QUIC listener] Long header packet type=~p, DCID=~p~n",
-                                  [PacketType, DCID]),
+            error_logger:info_msg(
+                "[QUIC listener] Long header packet type=~p, DCID=~p~n",
+                [PacketType, DCID]
+            ),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {error, Reason} ->
             error_logger:warning_msg("[QUIC listener] Failed to parse packet: ~p~n", [Reason]),
@@ -359,9 +383,13 @@ handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) -
 
 %% Parse packet header to extract DCID for routing
 %% DCIDLen parameter specifies expected DCID length for short header packets
-parse_packet_header(<<FirstByte, Version:32, DCIDLenField, DCID:DCIDLenField/binary,
-                      SCIDLen, SCID:SCIDLen/binary, Rest/binary>>, _DCIDLen)
-        when FirstByte band 16#80 =:= 16#80 ->
+parse_packet_header(
+    <<FirstByte, Version:32, DCIDLenField, DCID:DCIDLenField/binary, SCIDLen, SCID:SCIDLen/binary,
+        Rest/binary>>,
+    _DCIDLen
+) when
+    FirstByte band 16#80 =:= 16#80
+->
     %% Long header - extract packet type from bits 4-5 of first byte
     %% Type: 00=Initial, 01=0-RTT, 10=Handshake, 11=Retry
     PacketType = (FirstByte bsr 4) band 2#11,
@@ -381,8 +409,13 @@ parse_packet_header(_, _DCIDLen) ->
     {error, invalid_header}.
 
 %% Handle Initial packet - may create new connection
-handle_initial_packet(Packet, DCID, Version, RemoteAddr,
-                      #listener_state{connections = Conns} = State) ->
+handle_initial_packet(
+    Packet,
+    DCID,
+    Version,
+    RemoteAddr,
+    #listener_state{connections = Conns} = State
+) ->
     case ets:lookup(Conns, DCID) of
         [{DCID, ConnPid}] ->
             %% Existing connection
@@ -393,8 +426,12 @@ handle_initial_packet(Packet, DCID, Version, RemoteAddr,
     end.
 
 %% Route packet to existing connection
-route_to_connection(DCID, Packet, RemoteAddr,
-                    #listener_state{connections = Conns} = State) ->
+route_to_connection(
+    DCID,
+    Packet,
+    RemoteAddr,
+    #listener_state{connections = Conns} = State
+) ->
     case ets:lookup(Conns, DCID) of
         [{DCID, ConnPid}] ->
             send_to_connection(ConnPid, Packet, RemoteAddr);
@@ -404,23 +441,29 @@ route_to_connection(DCID, Packet, RemoteAddr,
     end.
 
 %% Create a new server-side connection
-create_connection(Packet, DCID, Version, RemoteAddr,
-                  #listener_state{
-                      socket = Socket,
-                      cert = Cert,
-                      cert_chain = CertChain,
-                      private_key = PrivateKey,
-                      alpn_list = ALPNList,
-                      connections = Conns,
-                      connection_handler = ConnHandler,
-                      cid_config = CIDConfig,
-                      opts = Opts
-                  }) ->
+create_connection(
+    Packet,
+    DCID,
+    Version,
+    RemoteAddr,
+    #listener_state{
+        socket = Socket,
+        cert = Cert,
+        cert_chain = CertChain,
+        private_key = PrivateKey,
+        alpn_list = ALPNList,
+        connections = Conns,
+        connection_handler = ConnHandler,
+        cid_config = CIDConfig,
+        opts = Opts
+    }
+) ->
     %% Generate server connection ID (LB-aware if configured)
-    ServerCID = case CIDConfig of
-        undefined -> crypto:strong_rand_bytes(8);
-        #cid_config{} -> quic_lb:generate_cid(CIDConfig)
-    end,
+    ServerCID =
+        case CIDConfig of
+            undefined -> crypto:strong_rand_bytes(8);
+            #cid_config{} -> quic_lb:generate_cid(CIDConfig)
+        end,
 
     %% Start connection process with client's QUIC version
     ConnOpts = #{
@@ -466,16 +509,19 @@ create_connection(Packet, DCID, Version, RemoteAddr,
                                 {error, Reason} ->
                                     error_logger:warning_msg(
                                         "QUIC listener: failed to set owner for ~p: ~p~n",
-                                        [ConnRef, Reason])
+                                        [ConnRef, Reason]
+                                    )
                             end;
                         {error, HandlerError} ->
                             error_logger:warning_msg(
                                 "QUIC listener: connection_handler failed: ~p~n",
-                                [HandlerError]);
+                                [HandlerError]
+                            );
                         Other ->
                             error_logger:warning_msg(
                                 "QUIC listener: connection_handler returned unexpected: ~p~n",
-                                [Other])
+                                [Other]
+                            )
                     end
             end,
 
@@ -496,8 +542,12 @@ send_to_connection(ConnPid, Packet, RemoteAddr) ->
 %%====================================================================
 
 %% Handle packet to unknown connection - potentially send stateless reset
-handle_unknown_packet(DCID, Packet, {IP, Port},
-                      #listener_state{socket = Socket, reset_secret = Secret}) ->
+handle_unknown_packet(
+    DCID,
+    Packet,
+    {IP, Port},
+    #listener_state{socket = Socket, reset_secret = Secret}
+) ->
     %% RFC 9000 Section 10.3.3: Don't send reset if packet might be a reset
     case is_potential_stateless_reset(Packet) of
         true ->
@@ -544,7 +594,9 @@ build_stateless_reset(Token, TriggerSize) ->
     %% but at least 21 bytes. Use a size between 21 and TriggerSize-1.
     ResetSize = min(TriggerSize - 1, max(21, rand:uniform(20) + 21)),
     %% Unpredictable bits with fixed bit = 1 (first bit = 0 for short header)
-    RandomLen = ResetSize - 17,  % 1 byte header + 16 byte token
+
+    % 1 byte header + 16 byte token
+    RandomLen = ResetSize - 17,
     RandomBytes = crypto:strong_rand_bytes(RandomLen),
     %% First byte: 0|1|XXXX = short header with fixed bit set
     %% Use random bits for rest to be unpredictable

@@ -130,8 +130,10 @@ get_connections(Name) ->
             %% Collect connections from all listeners
             Connections = lists:flatmap(
                 fun(ListenerPid) ->
-                    try quic_listener:get_connections(ListenerPid)
-                    catch _:_ -> []
+                    try
+                        quic_listener:get_connections(ListenerPid)
+                    catch
+                        _:_ -> []
                     end
                 end,
                 Listeners
@@ -170,7 +172,6 @@ handle_call({register, Name, Pid, Port, Opts}, _From, State = #state{monitors = 
 
     NewMonitors = Monitors#{MonRef => Name},
     {reply, ok, State#state{monitors = NewMonitors}};
-
 handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
     %% Find and remove the monitor
     case ets:lookup(?TABLE, Name) of
@@ -187,7 +188,6 @@ handle_call({unregister, Name}, _From, State = #state{monitors = Monitors}) ->
         [] ->
             {reply, ok, State}
     end;
-
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -204,7 +204,6 @@ handle_info({'DOWN', MonRef, process, _Pid, _Reason}, State = #state{monitors = 
             NewMonitors = maps:remove(MonRef, Monitors),
             {noreply, State#state{monitors = NewMonitors}}
     end;
-
 handle_info(_Info, State) ->
     {noreply, State}.
 
