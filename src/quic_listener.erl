@@ -56,6 +56,10 @@
 ]).
 
 -include("quic.hrl").
+-include_lib("kernel/include/logger.hrl").
+-define(QUIC_LOG_META, #{
+    domain => [erlang_quic, listener], report_cb => fun quic_log:format_report/2
+}).
 
 -record(listener_state, {
     socket :: gen_udp:socket(),
@@ -216,9 +220,9 @@ handle_info(
     {udp, Socket, SrcIP, SrcPort, Packet},
     #listener_state{socket = Socket} = State
 ) ->
-    error_logger:info_msg(
-        "[QUIC listener] Received UDP packet from ~p:~p, size=~p~n",
-        [SrcIP, SrcPort, byte_size(Packet)]
+    ?LOG_INFO(
+        #{what => udp_received, src_ip => SrcIP, src_port => SrcPort, size => byte_size(Packet)},
+        ?QUIC_LOG_META
     ),
     handle_packet(Packet, {SrcIP, SrcPort}, State),
     {noreply, State};
@@ -305,14 +309,16 @@ init_cid_config(Opts, ResetSecret) ->
                         {ok, CIDConfig} ->
                             {CIDConfig, CIDLen};
                         {error, Reason} ->
-                            error_logger:warning_msg(
-                                "QUIC listener: invalid CID config: ~p~n", [Reason]
+                            ?LOG_WARNING(
+                                #{what => invalid_cid_config, reason => Reason},
+                                ?QUIC_LOG_META
                             ),
                             {undefined, 8}
                     end;
                 {error, Reason} ->
-                    error_logger:warning_msg(
-                        "QUIC listener: invalid LB config: ~p~n", [Reason]
+                    ?LOG_WARNING(
+                        #{what => invalid_lb_config, reason => Reason},
+                        ?QUIC_LOG_META
                     ),
                     {undefined, 8}
             end;
@@ -329,8 +335,9 @@ init_cid_config(Opts, ResetSecret) ->
                 {ok, CIDConfig} ->
                     {CIDConfig, CIDLen};
                 {error, Reason} ->
-                    error_logger:warning_msg(
-                        "QUIC listener: invalid CID config: ~p~n", [Reason]
+                    ?LOG_WARNING(
+                        #{what => invalid_cid_config, reason => Reason},
+                        ?QUIC_LOG_META
                     ),
                     {undefined, 8}
             end
@@ -362,22 +369,27 @@ get_tables(_) ->
 handle_packet(Packet, RemoteAddr, #listener_state{dcid_len = DCIDLen} = State) ->
     case parse_packet_header(Packet, DCIDLen) of
         {initial, DCID, _SCID, Version, _Rest} ->
-            error_logger:info_msg(
-                "[QUIC listener] Initial packet from ~p, DCID=~p, Version=~.16B~n",
-                [RemoteAddr, DCID, Version]
+            ?LOG_INFO(
+                #{
+                    what => initial_packet,
+                    remote_addr => RemoteAddr,
+                    dcid => DCID,
+                    version => Version
+                },
+                ?QUIC_LOG_META
             ),
             handle_initial_packet(Packet, DCID, Version, RemoteAddr, State);
         {short, DCID, _Rest} ->
-            error_logger:info_msg("[QUIC listener] Short header packet, DCID=~p~n", [DCID]),
+            ?LOG_INFO(#{what => short_header_packet, dcid => DCID}, ?QUIC_LOG_META),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {long, DCID, _SCID, PacketType, _Rest} ->
-            error_logger:info_msg(
-                "[QUIC listener] Long header packet type=~p, DCID=~p~n",
-                [PacketType, DCID]
+            ?LOG_INFO(
+                #{what => long_header_packet, packet_type => PacketType, dcid => DCID},
+                ?QUIC_LOG_META
             ),
             route_to_connection(DCID, Packet, RemoteAddr, State);
         {error, Reason} ->
-            error_logger:warning_msg("[QUIC listener] Failed to parse packet: ~p~n", [Reason]),
+            ?LOG_WARNING(#{what => packet_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             ok
     end.
 
@@ -481,10 +493,10 @@ create_connection(
         version => Version
     },
 
-    error_logger:info_msg("[QUIC listener] Creating connection for DCID=~p~n", [DCID]),
+    ?LOG_INFO(#{what => creating_connection, dcid => DCID}, ?QUIC_LOG_META),
     case quic_connection:start_server(maps:merge(Opts, ConnOpts)) of
         {ok, ConnPid} ->
-            error_logger:info_msg("[QUIC listener] Connection created: ~p~n", [ConnPid]),
+            ?LOG_INFO(#{what => connection_created, conn_pid => ConnPid}, ?QUIC_LOG_META),
             %% Get connection reference
             %% Note: ConnPid is already linked via start_link in start_server/1
             ConnRef = gen_statem:call(ConnPid, get_ref),
@@ -507,20 +519,30 @@ create_connection(
                                 ok ->
                                     ok;
                                 {error, Reason} ->
-                                    error_logger:warning_msg(
-                                        "QUIC listener: failed to set owner for ~p: ~p~n",
-                                        [ConnRef, Reason]
+                                    ?LOG_WARNING(
+                                        #{
+                                            what => set_owner_failed,
+                                            conn_ref => ConnRef,
+                                            reason => Reason
+                                        },
+                                        ?QUIC_LOG_META
                                     )
                             end;
                         {error, HandlerError} ->
-                            error_logger:warning_msg(
-                                "QUIC listener: connection_handler failed: ~p~n",
-                                [HandlerError]
+                            ?LOG_WARNING(
+                                #{
+                                    what => connection_handler_failed,
+                                    error => HandlerError
+                                },
+                                ?QUIC_LOG_META
                             );
                         Other ->
-                            error_logger:warning_msg(
-                                "QUIC listener: connection_handler returned unexpected: ~p~n",
-                                [Other]
+                            ?LOG_WARNING(
+                                #{
+                                    what => connection_handler_unexpected,
+                                    result => Other
+                                },
+                                ?QUIC_LOG_META
                             )
                     end
             end,
@@ -530,7 +552,7 @@ create_connection(
 
             {ok, ConnPid};
         {error, Reason} ->
-            error_logger:warning_msg("[QUIC listener] Failed to start connection: ~p~n", [Reason]),
+            ?LOG_WARNING(#{what => start_connection_failed, reason => Reason}, ?QUIC_LOG_META),
             {error, Reason}
     end.
 
