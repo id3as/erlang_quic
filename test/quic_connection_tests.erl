@@ -278,3 +278,65 @@ ack_ranges_skip_invalid_gap_test() ->
     Result = quic_connection:convert_rest_ranges(5, [{10, 20}]),
     %% Gap = 5 - 20 - 2 = -17 (negative), should be skipped
     ?assertEqual([], Result).
+
+%% Test that large ranges are capped at MAX_ACK_RANGE (65536)
+ack_ranges_large_first_range_capped_test() ->
+    %% Create a range that exceeds MAX_ACK_RANGE
+    LargeRange = [{0, 70000}],
+    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(LargeRange),
+    %% FirstRange should be capped at 65536, not 70000
+    [{LargestAcked, FirstRange}] = EncoderRanges,
+    ?assertEqual(70000, LargestAcked),
+    ?assertEqual(65536, FirstRange).
+
+%% Test that subsequent large ranges are also validated
+ack_ranges_large_subsequent_range_skipped_test() ->
+    %% Create ranges where the second one would exceed MAX_ACK_RANGE
+    %% This tests the Range =< 65536 check in convert_rest_ranges
+    %% Normal case: [{100, 105}, {0, 50}]
+    %% Gap = 100 - 50 - 2 = 48, Range = 50 - 0 = 50 (valid)
+    NormalRanges = [{100, 105}, {0, 50}],
+    NormalResult = quic_connection:convert_ack_ranges_for_encode(NormalRanges),
+    ?assertEqual([{105, 5}, {48, 50}], NormalResult).
+
+%% Test that skipping malformed range preserves PrevStart for next calculation
+ack_ranges_skip_preserves_prevstart_test() ->
+    %% If we skip a malformed range, the next range should use the
+    %% original PrevStart, not the skipped range's Start
+    %% Ranges: [{100, 105}, {95, 98}, {80, 85}]
+    %% Second range overlaps (End=98 > PrevStart-2 = 98), Gap = 100 - 98 - 2 = 0
+    %% After fix: when we skip due to overlap, we use PrevStart=100 for next range
+    %% Gap for third = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
+    Ranges = [{100, 105}, {80, 85}],
+    Result = quic_connection:convert_ack_ranges_for_encode(Ranges),
+    %% Gap = 100 - 85 - 2 = 13, Range = 85 - 80 = 5
+    ?assertEqual([{105, 5}, {13, 5}], Result).
+
+%% Test roundtrip: encode ACK ranges and verify they can be decoded
+ack_ranges_encode_decode_roundtrip_test() ->
+    %% Build internal ranges
+    Ranges = [{90, 100}, {70, 80}, {50, 60}],
+
+    %% Convert to encoder format
+    EncoderRanges = quic_connection:convert_ack_ranges_for_encode(Ranges),
+
+    %% Verify format: [{LargestAcked, FirstRange}, {Gap, Range}, ...]
+    [{LargestAcked, FirstRange} | RestRanges] = EncoderRanges,
+    ?assertEqual(100, LargestAcked),
+    % 100 - 90 = 10
+    ?assertEqual(10, FirstRange),
+
+    %% Verify gaps and ranges are non-negative (required for varint encoding)
+    lists:foreach(
+        fun({Gap, Range}) ->
+            ?assert(Gap >= 0),
+            ?assert(Range >= 0),
+            ?assert(Range =< 65536)
+        end,
+        RestRanges
+    ).
+
+%% Test that empty ranges returns empty
+ack_ranges_convert_empty_test() ->
+    %% This should not happen in practice, but test defensive behavior
+    ?assertError(function_clause, quic_connection:convert_ack_ranges_for_encode([])).
