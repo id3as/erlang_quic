@@ -1311,6 +1311,13 @@ cipher_code_to_atom(?TLS_AES_256_GCM_SHA384) -> aes_256_gcm;
 cipher_code_to_atom(?TLS_CHACHA20_POLY1305_SHA256) -> chacha20_poly1305;
 cipher_code_to_atom(_) -> unknown.
 
+%% Convert internal cipher atom to TLS cipher suite code
+%% Used when building ServerHello to send the correct cipher suite to client
+cipher_atom_to_code(aes_128_gcm) -> ?TLS_AES_128_GCM_SHA256;
+cipher_atom_to_code(aes_256_gcm) -> ?TLS_AES_256_GCM_SHA384;
+cipher_atom_to_code(chacha20_poly1305) -> ?TLS_CHACHA20_POLY1305_SHA256;
+cipher_atom_to_code(_) -> ?TLS_AES_128_GCM_SHA256.
+
 %% Server: Negotiate ALPN
 negotiate_alpn(ClientALPN, ServerALPN) ->
     case [A || A <- ServerALPN, lists:member(A, ClientALPN)] of
@@ -2893,8 +2900,9 @@ process_tls_message(
             ALPN = negotiate_alpn(ClientALPN, State#state.alpn_list),
 
             %% Build ServerHello
+            %% RFC 8446: cipher_suite must be the integer code, not atom
             {ServerHello, _ServerPrivKey2} = quic_tls:build_server_hello(#{
-                cipher => Cipher,
+                cipher_suite => cipher_atom_to_code(Cipher),
                 key_pair => {ServerPubKey, ServerPrivKey},
                 session_id => SessionId
             }),
