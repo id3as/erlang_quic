@@ -32,6 +32,10 @@
 -behaviour(gen_statem).
 
 -include("quic.hrl").
+-include_lib("kernel/include/logger.hrl").
+-define(QUIC_LOG_META, #{
+    domain => [erlang_quic, connection], report_cb => fun quic_log:format_report/2
+}).
 
 %% Suppress warnings for helper functions prepared for future use
 -compile([{nowarn_unused_function, [{send_handshake_ack, 1}]}]).
@@ -1761,10 +1765,7 @@ decode_frame_for_tracking(FrameBin) when is_binary(FrameBin) ->
         {Frame, _Rest} when is_tuple(Frame); is_atom(Frame) -> {true, Frame};
         {error, _} ->
             %% Log but don't include unknown frames in tracking
-            error_logger:warning_msg(
-                "[QUIC] Failed to decode frame for tracking: ~p~n",
-                [FrameBin]
-            ),
+            ?LOG_WARNING(#{what => frame_decode_failed, frame_bin => FrameBin}, ?QUIC_LOG_META),
             false
     end;
 decode_frame_for_tracking(_) ->
@@ -1963,9 +1964,14 @@ send_app_packet_internal(Payload, Frames, State) ->
         {error, Reason} ->
             %% Send failed - do NOT track packet as sent to avoid CC/loss inconsistency
             %% The data will be re-sent via the PTO timeout mechanism
-            error_logger:warning_msg(
-                "[QUIC] UDP send failed: ~p (PN=~p, size=~p)~n",
-                [Reason, PN, PacketSize]
+            ?LOG_WARNING(
+                #{
+                    what => udp_send_failed,
+                    reason => Reason,
+                    pn => PN,
+                    size => PacketSize
+                },
+                ?QUIC_LOG_META
             ),
             %% Still bump PN to avoid reusing packet numbers
             NewPNSpace = PNSpace#pn_space{next_pn = PN + 1},
@@ -2031,9 +2037,14 @@ handle_packet_loop(Data, State) ->
             State;
         {error, Reason} ->
             %% Log decryption failure for debugging
-            error_logger:warning_msg(
-                "[QUIC ~p] Packet decode/decrypt failed: ~p, size=~p~n",
-                [State#state.role, Reason, byte_size(Data)]
+            ?LOG_WARNING(
+                #{
+                    what => packet_decode_decrypt_failed,
+                    role => State#state.role,
+                    reason => Reason,
+                    size => byte_size(Data)
+                },
+                ?QUIC_LOG_META
             ),
             %% Re-enable socket
             maybe_reenable_socket(State),
@@ -2067,9 +2078,12 @@ decode_and_decrypt_packet(Data, State) ->
             decode_short_header_packet(Data, State);
         <<0:1, 0:1, _:6, _/binary>> ->
             %% Short header form but fixed bit = 0 - invalid, skip as padding
-            error_logger:warning_msg(
-                "[QUIC] Invalid short header: fixed bit not set, first byte=~p~n",
-                [binary:first(Data)]
+            ?LOG_WARNING(
+                #{
+                    what => invalid_short_header_fixed_bit,
+                    first_byte => binary:first(Data)
+                },
+                ?QUIC_LOG_META
             ),
             {error, invalid_fixed_bit};
         _ ->
@@ -2332,7 +2346,7 @@ find_matching_reset_token(Token, [_ | Rest]) ->
 decode_short_header_packet(Data, State) ->
     case State#state.app_keys of
         undefined ->
-            error_logger:warning_msg("[QUIC] No app keys yet for short header packet~n"),
+            ?LOG_WARNING(#{what => no_app_keys_short_header}, ?QUIC_LOG_META),
             %% No app keys yet - check if this might be a stateless reset
             check_stateless_reset(Data, State);
         {ClientKeys, ServerKeys} ->
@@ -2349,8 +2363,8 @@ decode_short_header_packet(Data, State) ->
             Header = <<FirstByte, DCID/binary>>,
             %% No remaining data after short header packet
             case decrypt_app_packet(Header, EncryptedPayload, DecryptKeys, State) of
-                {error, decryption_failed} = Err ->
-                    error_logger:warning_msg("[QUIC] Short header decryption failed~n"),
+                {error, decryption_failed} ->
+                    ?LOG_WARNING(#{what => short_header_decryption_failed}, ?QUIC_LOG_META),
                     %% Decryption failed - check if this is a stateless reset
                     check_stateless_reset(Data, State);
                 {ok, Type, Frames, Remaining, NewState} = Result ->
@@ -2504,7 +2518,7 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
             case quic_loss:on_ack_received(LossState, AckFrame, Now) of
                 {error, ack_range_too_large} ->
                     %% RFC 9000: Invalid ACK range is a protocol violation
-                    error_logger:error_msg("[QUIC] Invalid ACK range received, ignoring~n"),
+                    ?LOG_ERROR(#{what => invalid_ack_range}, ?QUIC_LOG_META),
                     State;
                 {NewLossState, AckedPackets, LostPackets} ->
                     %% Calculate total bytes acked and lost
@@ -2940,7 +2954,7 @@ process_tls_message(
             %% Send EncryptedExtensions, Certificate, CertificateVerify, Finished in Handshake packet
             send_server_handshake_flight(Cipher, TranscriptHash, State2);
         {error, Reason} ->
-            error_logger:error_msg("[QUIC server] ClientHello parsing failed: ~p~n", [Reason]),
+            ?LOG_ERROR(#{what => client_hello_parse_failed, reason => Reason}, ?QUIC_LOG_META),
             State
     end;
 %% Client receives ServerHello
@@ -3268,13 +3282,16 @@ process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
 %%====================================================================
 
 process_stream_data(StreamId, Offset, Data, Fin, State) ->
-    #state{owner = Owner, conn_ref = Ref, streams = Streams, role = Role} = State,
+    #state{role = Role} = State,
 
     %% RFC 9000 Section 2.1: Validate stream direction
     %% Cannot receive on locally-initiated unidirectional streams
     case validate_receive_stream(StreamId, Role) of
         {error, Reason} ->
-            error_logger:warning_msg("[QUIC] Invalid receive stream ~p: ~p~n", [StreamId, Reason]),
+            ?LOG_WARNING(
+                #{what => invalid_receive_stream, stream_id => StreamId, reason => Reason},
+                ?QUIC_LOG_META
+            ),
             % Silently ignore (could send STREAM_STATE_ERROR)
             State;
         ok ->
@@ -3340,17 +3357,26 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
     case {EndOffset > RecvMaxData, DataReceived + DataSize > MaxDataLocal} of
         {true, _} ->
             %% Stream-level flow control violation
-            error_logger:warning_msg(
-                "[QUIC FC] Stream ~p flow control violation: end=~p > max=~p~n",
-                [StreamId, EndOffset, RecvMaxData]
+            ?LOG_WARNING(
+                #{
+                    what => stream_flow_control_violation,
+                    stream_id => StreamId,
+                    end_offset => EndOffset,
+                    recv_max_data => RecvMaxData
+                },
+                ?QUIC_LOG_META
             ),
             % Could send FLOW_CONTROL_ERROR
             State;
         {_, true} ->
             %% Connection-level flow control violation
-            error_logger:warning_msg(
-                "[QUIC FC] Connection flow control violation: recv=~p > max=~p~n",
-                [DataReceived + DataSize, MaxDataLocal]
+            ?LOG_WARNING(
+                #{
+                    what => connection_flow_control_violation,
+                    recv => DataReceived + DataSize,
+                    max => MaxDataLocal
+                },
+                ?QUIC_LOG_META
             ),
             % Could send FLOW_CONTROL_ERROR
             State;
@@ -3948,9 +3974,8 @@ do_send_data(
             %% Check stream direction (can't send on peer's uni streams)
             case can_send_on_stream(StreamId, State) of
                 false ->
-                    error_logger:warning_msg(
-                        "[QUIC] Cannot send on peer-initiated uni stream ~p~n",
-                        [StreamId]
+                    ?LOG_WARNING(
+                        #{what => send_on_peer_uni_stream, stream_id => StreamId}, ?QUIC_LOG_META
                     ),
                     {error, stream_state_error};
                 true ->
@@ -3969,10 +3994,13 @@ do_send_data(
                     case {DataSize =< ConnectionAllowed, DataSize =< StreamAllowed} of
                         {false, _} ->
                             %% Connection-level flow control blocked
-                            error_logger:warning_msg(
-                                "[QUIC FC] Connection flow control blocked: "
-                                "need ~p, allowed ~p~n",
-                                [DataSize, ConnectionAllowed]
+                            ?LOG_WARNING(
+                                #{
+                                    what => connection_flow_control_blocked,
+                                    need => DataSize,
+                                    allowed => ConnectionAllowed
+                                },
+                                ?QUIC_LOG_META
                             ),
                             %% Queue for later - MUST return the updated state with queued data!
                             QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
@@ -3982,10 +4010,14 @@ do_send_data(
                             {ok, FinalState};
                         {_, false} ->
                             %% Stream-level flow control blocked
-                            error_logger:warning_msg(
-                                "[QUIC FC] Stream ~p flow control blocked: "
-                                "need ~p, allowed ~p~n",
-                                [StreamId, DataSize, StreamAllowed]
+                            ?LOG_WARNING(
+                                #{
+                                    what => stream_flow_control_blocked,
+                                    stream_id => StreamId,
+                                    need => DataSize,
+                                    allowed => StreamAllowed
+                                },
+                                ?QUIC_LOG_META
                             ),
                             %% Queue for later - MUST return the updated state with queued data!
                             QueuedState = queue_stream_data(StreamId, Offset, DataBin, Fin, State),
