@@ -1791,10 +1791,14 @@ build_ack_frame(Ranges) ->
     quic_frame:encode({ack, EncoderRanges, AckDelay, undefined}).
 
 %% Convert internal ACK ranges to encoder format
+%% Limits ranges to MAX_ACK_RANGE (65536) to prevent receiver rejection
 convert_ack_ranges_for_encode([{Start, End} | Rest]) ->
     %% First range: LargestAcked = End, FirstRange = End - Start
-    FirstRange = End - Start,
-    RestConverted = convert_rest_ranges(Start, Rest),
+    %% Cap FirstRange at 65536 to stay within receiver's MAX_ACK_RANGE limit
+    FirstRange = min(End - Start, 65536),
+    %% Adjust Start for the capped range
+    AdjustedStart = End - FirstRange,
+    RestConverted = convert_rest_ranges(AdjustedStart, Rest),
     [{End, FirstRange} | RestConverted].
 
 convert_rest_ranges(_PrevStart, []) ->
@@ -1805,12 +1809,14 @@ convert_rest_ranges(PrevStart, [{Start, End} | Rest]) ->
     %% Range = End - Start (number of packets in this block)
     Range = End - Start,
     %% Validate: Gap and Range must be non-negative for valid ACK ranges
-    case Gap >= 0 andalso Range >= 0 of
+    %% Also check that Range doesn't exceed MAX_ACK_RANGE (65536) to prevent receiver rejection
+    case Gap >= 0 andalso Range >= 0 andalso Range =< 65536 of
         true ->
             [{Gap, Range} | convert_rest_ranges(Start, Rest)];
         false ->
             %% Skip malformed range (defensive - shouldn't happen with proper range tracking)
-            convert_rest_ranges(Start, Rest)
+            %% Use PrevStart (not Start) to maintain correct gap calculation for next range
+            convert_rest_ranges(PrevStart, Rest)
     end.
 
 %% Send a Handshake packet
