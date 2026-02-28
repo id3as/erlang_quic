@@ -2585,11 +2585,17 @@ process_frame(_Level, {ack, Ranges, AckDelay, ECN}, State) ->
                     %% Retransmit lost packets
                     State2 = retransmit_lost_packets(LostPackets, State1),
 
+                    %% RFC 9000 §3.4: Clean up fully-acked send-only streams.
+                    %% When all data including FIN has been acknowledged on a
+                    %% locally-initiated unidirectional stream, the stream
+                    %% transitions to "Data Recvd" and can be freed.
+                    State3 = cleanup_completed_send_streams(AckedPackets, State2),
+
                     %% Reset PTO timer after ACK processing
-                    State3 = set_pto_timer(State2),
+                    State4 = set_pto_timer(State3),
 
                     %% Try to send queued data now that cwnd may have freed up
-                    process_send_queue(State3)
+                    process_send_queue(State4)
                 %% close inner case (on_ack_received)
             end
         %% close outer case (Ranges)
@@ -4382,6 +4388,46 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
             }};
         error ->
             {error, unknown_stream}
+    end.
+
+%% RFC 9000 §3.4: Clean up locally-initiated unidirectional streams that have
+%% been fully acknowledged (all data + FIN acked). These streams are send-only
+%% from our perspective, so once the peer has acknowledged everything including
+%% FIN, the stream is in the "Data Recvd" terminal state and can be freed.
+%% Without this cleanup, completed uni streams accumulate in the streams map
+%% and count against the peer's max_streams_uni limit indefinitely.
+cleanup_completed_send_streams(AckedPackets, #state{role = Role, streams = Streams} = State) ->
+    %% Collect stream IDs that had FIN acked in this batch
+    FinAckedStreamIds = lists:foldl(
+        fun(#sent_packet{frames = Frames}, Acc) ->
+            lists:foldl(
+                fun({stream, StreamId, _Offset, _Data, true}, InnerAcc) ->
+                        sets:add_element(StreamId, InnerAcc);
+                   (_, InnerAcc) ->
+                        InnerAcc
+                end, Acc, Frames)
+        end, sets:new([{version, 2}]), AckedPackets),
+    %% For each FIN-acked stream, check if it's a locally-initiated uni stream
+    %% with send_fin=true. If so, remove it from the streams map.
+    LocalUniPattern = case Role of
+        client -> 2;   % Client-initiated uni: ID band 0x03 == 2
+        server -> 3    % Server-initiated uni: ID band 0x03 == 3
+    end,
+    StreamIdsToRemove = sets:filter(
+        fun(StreamId) ->
+            (StreamId band 16#03) =:= LocalUniPattern andalso
+            case maps:find(StreamId, Streams) of
+                {ok, #stream_state{send_fin = true}} -> true;
+                _ -> false
+            end
+        end, FinAckedStreamIds),
+    case sets:size(StreamIdsToRemove) of
+        0 -> State;
+        _ ->
+            NewStreams = sets:fold(
+                fun(StreamId, Acc) -> maps:remove(StreamId, Acc) end,
+                Streams, StreamIdsToRemove),
+            State#state{streams = NewStreams}
     end.
 
 %% Set stream priority (RFC 9218)
